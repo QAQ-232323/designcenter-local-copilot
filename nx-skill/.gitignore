@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Compiled bridge binaries: build them locally with scripts/build_dotnet_bridge.ps1
+scripts/dotnet_bridge/bin/
+nx_runtime/startup/*.dll
+nx_runtime/startup/*.pdb
+
+# Generated NX custom-directory file and logs
+custom_dirs.dat
+*.log
+
+# Workspaces and generated parts
+.work/
+generated/
+*.prt

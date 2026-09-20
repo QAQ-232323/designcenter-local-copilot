@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "nx": {
+      "command": "python",
+      "args": ["-m", "nx_skill.mcp"],
+      "env": {
+        "PYTHONPATH": "src",
+        "NX_SKILL_AUTO_LAUNCH": "true",
+        "NX_SKILL_AUTO_LAUNCH_TIMEOUT": "240"
+      }
+    }
+  }
+}

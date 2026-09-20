@@ -1,14 +1,14 @@
 # Designcenter 2606 内置 AI(Copilot)页面 — 本地调出方案
 
 把 Siemens Designcenter / NX **内置的 Copilot 页面**在本地宿主里跑起来,后端换成你自己的模型,
-再通过 [nx-skill](https://github.com/) 让它**真的能建模** —— 出计划、过门禁、在 NX 里执行。
+再通过 [nx-skill](nx-skill/)(本仓库子项目)让它**真的能建模** —— 出计划、过门禁、在 NX 里执行。
 
 **这个仓库里有什么**
 
 | | |
 |---|---|
 | `plchat-local/` | 本地宿主:页面桥 + 多供应商后端 + 计划生成 / 静态门禁 / 执行编排 |
-| `integrations/nx-skill/` | NX 侧集成件:菜单、工具条、.NET 实时桥(**含补丁后的完整源码**) |
+| `nx-skill/` | **子项目**:NXOpen 技能包 —— Python 包 + CLI + MCP server(23 个工具)/ 批处理 journal / 人工节拍 review,外加 NX 侧菜单与 .NET 实时桥 |
 | `README.md` | 从"页面为什么点不动"到"live 模式为什么连不上"的完整踩坑记录(18 节) |
 | `FUSION-nx-skill.md` | 两者融合的设计(脸 / 脑 / 手分层, P0–P3 实施分级) |
 
@@ -115,10 +115,12 @@ set UGII_PLCHAT_CUSTOM_BACKEND_URL=http://127.0.0.1:8765/api/ask
 ```
 ├─ README.md                    本文档
 ├─ FUSION-nx-skill.md           本方案与 nx-skill 融合的设计(脸/脑/手分层, P0–P3 分级)
-├─ LICENSE                      MIT(仅覆盖本仓库自研代码, 见文末说明)
-├─ integrations/nx-skill/       NX 侧集成件 —— 详见该目录 README
-│  ├─ nx_runtime/                 菜单/工具条/回调脚本
-│  └─ dotnet_bridge/              .NET 实时桥源码(已含 127.0.0.1 补丁)
+├─ LICENSE                      MIT(本仓库自研代码; nx-skill/ 另有自己的 MIT)
+├─ nx-skill/                    ★子项目: NXOpen 技能包(独立 MIT, 详见该目录 README)
+│  ├─ src/nx_skill/               Python 包: CLI + MCP server + 发现 / 计划 / 评审
+│  ├─ nx_runtime/                 NX 加载侧: 菜单 / 工具条 / 回调脚本
+│  ├─ scripts/dotnet_bridge/      .NET 实时桥源码(已含 127.0.0.1 补丁)
+│  └─ docs/                       架构 / 官方文档摘要 / 排障
 └─ plchat-local/                本地宿主
    ├─ start.cmd                   一键启动(起服务 + 开浏览器)
    ├─ server.js                   ★宿主后端(零依赖): 静态托管 + /api/ask
@@ -135,6 +137,11 @@ set UGII_PLCHAT_CUSTOM_BACKEND_URL=http://127.0.0.1:8765/api/ask
    ├─ plchat.js / NXService.js / ...   ← 不随仓库分发, 由 fetch-frontend.sh 重建
    └─ plchat_v2/                       ← 同上, 官方前端镜像
 ```
+
+> **关于路径**: `nx-skill/` 的物理位置在仓库内。本机的 `E:\AIprojects\nx-skill` 是一个
+> **目录联接(junction)** 指向它,所以 `UGII_USER_DIR`、`config.json` 里的 `nxSkillRoot`、
+> NX 菜单配置等既有设置**全部照旧可用,不需要改**。换机器时把 `nxSkillRoot` 指到
+> `<仓库>\nx-skill` 即可(注意 NX/Python 对含中文的路径敏感,建议放在纯 ASCII 路径下)。
 
 ## 7. 原理(宿主桥协议)
 
@@ -673,8 +680,8 @@ props["machineName"] = "127.0.0.1";   // 显式用回环地址发布
 ```
 客户端侧也把 `http://localhost:...` 改成了 `http://127.0.0.1:...`。
 
-> 打完补丁的完整源码已归档在 `integrations/nx-skill/dotnet_bridge/`,
-> 直接覆盖你 nx-skill 检出里的同名文件即可;细节见该目录的 README。
+> 打完补丁的完整源码就在 `nx-skill/scripts/dotnet_bridge/`(server + client 两边都改了)。
+> 这条坑已写进 `nx-skill/docs/troubleshooting.md` 的 live bridge 小节。
 
 **应用步骤**(DLL 被运行中的 NX 锁着,必须关掉 DC):
 ```bat
@@ -685,3 +692,14 @@ server + client。做完重启 Designcenter,再点一次 Start NX Skill Live Bri
 
 > 已用 `-ClientOnly` 单独编译验证过:补丁本身**编译通过**,原先的失败是
 > `error CS0016 无法写入输出文件…另一个进程正在使用` —— 纯粹是文件锁,不是语法错。
+
+---
+
+## 贡献者
+
+见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。
+
+* **kamao6757-crypto** —— 项目作者:需求、方向、真机验证,以及 `nx-skill` 子项目。
+* **DeepSeek Harness** —— AI 编程代理:本仓库绝大部分代码与文档的实现。
+
+第三方归属与授权边界见该文件末尾与 `LICENSE`。

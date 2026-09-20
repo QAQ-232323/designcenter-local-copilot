@@ -1,0 +1,32 @@
+{
+  "name": "nx",
+  "version": "1.0.0",
+  "description": "Release-agnostic Siemens NX modelling skill: discovers any local NX installation, answers NXOpen API questions from the documentation shipped inside the install, and drives NX through batch journals or a live in-session bridge.",
+  "author": { "name": "nx-skill contributors" },
+  "license": "MIT",
+  "homepage": "https://github.com/kamao6757-crypto/nx-skill",
+  "repository": "https://github.com/kamao6757-crypto/nx-skill",
+  "keywords": [
+    "siemens-nx", "nxopen", "cad", "automation", "modeling", "simulation",
+    "cae", "image-modeling", "three-view", "orthographic",
+    "建模", "识图", "三视图", "仿真"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "NX",
+    "shortDescription": "Build and inspect Siemens NX models through explicit, verifiable commands.",
+    "longDescription": "Works with any locally installed NX or Designcenter release. Finds the installation without hardcoded paths, reads the release-exact NXOpen reference that ships inside it, and drives NX either through batch journals or a live bridge hosted in the open session.",
+    "developerName": "nx-skill contributors",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Check what NX installation is available on this machine.",
+      "建模: create an NX part model from my description.",
+      "识图建模: build an NX model from a three-view drawing and validate the views.",
+      "仿真: prepare a CAE analysis workflow for the current model.",
+      "Look up the NXOpen API for the feature I need to build."
+    ],
+    "brandColor": "#0E7490"
+  }
+}

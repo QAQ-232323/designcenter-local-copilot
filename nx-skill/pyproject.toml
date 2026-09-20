@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nx-skill"
+version = "1.0.0"
+description = "Portable skill and MCP server for driving Siemens NX through NXOpen, with release-agnostic discovery and offline API documentation."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "nx-skill contributors" }]
+keywords = [
+    "siemens-nx", "nxopen", "cad", "cae", "automation", "journal",
+    "mcp", "agent-skill", "designcenter",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Manufacturing",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+# The package has no runtime dependencies by design: it must import and run on a
+# bare machine, and inside NX's own embedded interpreter where pip is unavailable.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
+[project.scripts]
+nx-skill = "nx_skill.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/kamao6757-crypto/nx-skill#readme"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nx_skill"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
