@@ -39,6 +39,18 @@ from .review import OPERATIONS as REVIEW_OPERATIONS
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "nx-skill"
 
+WORKFLOW_URI = "nx-skill://guide/workflow"
+WORKFLOW_TEXT = (
+    "NX/Designcenter workflow: call nx_status first to discover the installed release and bridge. "
+    "Use nx_live_status to inspect the open Work Part before changing it. "
+    "Use nx_docs_search and nx_docs_member for release-specific NXOpen API names and signatures. "
+    "Prepare an ordered plan with named steps. For operations needing human review, submit the plan "
+    "through nx_review_submit and wait for the user to execute it in NX. "
+    "After execution, call nx_live_verify with explicit expectations, or inspect the review run log. "
+    "Do not claim a model change, save, or CAE solve succeeded from plan submission or script generation alone. "
+    "If NX or the bridge is unavailable, report that limit and avoid inventing model state."
+)
+
 
 # ---------------------------------------------------------------------------
 # Lazy context
@@ -293,6 +305,43 @@ def _h_live_status(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
     if not bridge.ping():
         bridge.ensure_online()
     return ok(bridge.status())
+
+
+def verify_model_status(status: Mapping[str, Any], args: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare explicit expectations with observed state; never infer success from a journal exit."""
+    checks: list[dict[str, Any]] = []
+    work_part = status.get("workPart") or {}
+    model = status.get("model") or {}
+    expected_path = args.get("part_path")
+    if expected_path:
+        actual = str(work_part.get("fullPath") or "")
+        checks.append({"field": "partPath", "expected": expected_path, "actual": actual,
+                       "passed": actual.casefold() == str(expected_path).casefold()})
+    minimum = args.get("min_features")
+    if minimum is not None:
+        features = model.get("features") or {}
+        actual = features.get("count") if features.get("available") else None
+        checks.append({"field": "featureCount", "expectedMinimum": minimum, "actual": actual,
+                       "passed": actual is not None and actual >= minimum})
+    required = args.get("feature_names") or []
+    if required:
+        features = model.get("features") or {}
+        names = features.get("names") or []
+        for name in required:
+            checks.append({"field": "featureName", "expected": name, "observed": names,
+                           "passed": bool(features.get("available")) and name in names})
+    return {"verified": bool(checks) and all(c["passed"] for c in checks), "checks": checks,
+            "inspectionAvailable": bool(model.get("available")), "workPart": work_part}
+
+
+def _h_live_verify(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
+    if not any(args.get(key) is not None for key in ("part_path", "min_features", "feature_names")):
+        raise InvalidArgument("Provide at least one expected part path, minimum feature count or feature name.")
+    minimum = args.get("min_features")
+    if minimum is not None and (not isinstance(minimum, int) or minimum < 0):
+        raise InvalidArgument("min_features must be a non-negative integer.")
+    status = _h_live_status(ctx, {})["result"]
+    return ok({**verify_model_status(status, args), "observed": status})
 
 
 def _h_live_module_list(ctx: Context, args: dict[str, Any]) -> dict[str, Any]:
@@ -550,9 +599,17 @@ TOOLS: tuple[Tool, ...] = (
     ),
     Tool(
         "nx_live_status",
-        "Ask the open NX session for its status, launching NX first when auto-launch is enabled.",
+        "Read the open NX session, work part and bounded model summary when available.",
         _object_schema({}),
         _h_live_status,
+    ),
+    Tool(
+        "nx_live_verify",
+        "Read the open NX model and verify explicit expectations against observed part path and features. "
+        "A failed or unavailable observation is never reported as verified.",
+        _object_schema({"part_path": _STR, "min_features": _INT,
+                        "feature_names": {"type": "array", "items": _STR}}),
+        _h_live_verify,
     ),
     Tool(
         "nx_live_module_list",
@@ -771,7 +828,7 @@ def handle(request: Mapping[str, Any], ctx: Context) -> dict[str, Any] | None:
             request_id,
             {
                 "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": False}},
+                "capabilities": {"tools": {"listChanged": False}, "resources": {}, "prompts": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": __version__},
                 "instructions": (
                     "Drives Siemens NX. Start with nx_status to see what is installed. "
@@ -785,8 +842,24 @@ def handle(request: Mapping[str, Any], ctx: Context) -> dict[str, Any] | None:
         return _result(request_id, {})
     if method == "tools/list":
         return _result(request_id, {"tools": list_tools()})
-    if method in {"resources/list", "prompts/list"}:
-        return _result(request_id, {"resources": []} if method.startswith("resources") else {"prompts": []})
+    if method == "resources/list":
+        return _result(request_id, {"resources": [{"uri": WORKFLOW_URI, "name": "NX workflow guide",
+                                                  "mimeType": "text/plain", "description": "Generic NX workflow and evidence rules"}]})
+    if method == "resources/read":
+        if params.get("uri") != WORKFLOW_URI:
+            return _error(request_id, -32602, "Unknown resource URI")
+        return _result(request_id, {"contents": [{"uri": WORKFLOW_URI, "mimeType": "text/plain", "text": WORKFLOW_TEXT}]})
+    if method == "prompts/list":
+        return _result(request_id, {"prompts": [{"name": "nx_model_task", "description": "Inspect, plan, execute and verify an NX task",
+                                              "arguments": [{"name": "request", "description": "The user's task", "required": True}]}]})
+    if method == "prompts/get":
+        if params.get("name") != "nx_model_task":
+            return _error(request_id, -32602, "Unknown prompt name")
+        request = str((params.get("arguments") or {}).get("request") or "").strip()
+        if not request:
+            return _error(request_id, -32602, "request is required")
+        return _result(request_id, {"description": "Grounded NX task workflow", "messages": [{
+            "role": "user", "content": {"type": "text", "text": WORKFLOW_TEXT + "\n\nUser task: " + request}}]})
     if method == "tools/call":
         name = params.get("name")
         if not isinstance(name, str):

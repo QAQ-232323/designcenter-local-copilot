@@ -85,7 +85,31 @@ def test_initialize_announces_capabilities(ctx):
     response = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, ctx)
     assert response["result"]["serverInfo"]["name"] == "nx-skill"
     assert "tools" in response["result"]["capabilities"]
+    assert "resources" in response["result"]["capabilities"]
+    assert "prompts" in response["result"]["capabilities"]
     assert response["result"]["instructions"]
+
+
+def test_workflow_resource_and_prompt_are_discoverable(ctx):
+    resources = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "resources/list"}, ctx)["result"]["resources"]
+    uri = resources[0]["uri"]
+    content = srv.handle({"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": uri}}, ctx)
+    assert "nx_live_verify" in content["result"]["contents"][0]["text"]
+    prompt = srv.handle({"jsonrpc": "2.0", "id": 3, "method": "prompts/get",
+                         "params": {"name": "nx_model_task", "arguments": {"request": "Create a block"}}}, ctx)
+    assert "Create a block" in prompt["result"]["messages"][0]["content"]["text"]
+
+
+def test_live_verify_requires_real_observations():
+    status = {"workPart": {"fullPath": "C:\\work\\part.prt"}, "model": {
+        "available": True, "features": {"available": True, "count": 2,
+                                         "names": ["01_Base", "02_Hole"]}}}
+    verified = srv.verify_model_status(status, {"part_path": "c:\\WORK\\part.prt",
+                                                "min_features": 2, "feature_names": ["02_Hole"]})
+    assert verified["verified"] is True
+    unavailable = srv.verify_model_status({"workPart": {}, "model": {"available": False}},
+                                           {"min_features": 1})
+    assert unavailable["verified"] is False
 
 
 def test_notifications_get_no_reply(ctx):

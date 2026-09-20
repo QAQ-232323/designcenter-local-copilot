@@ -7,7 +7,7 @@
 ## 0. 一句话
 
 `plchat-local` 提供**脸**(Designcenter 内置 Copilot 页面)和**脑**(任意大模型);
-`nx-skill` 提供**手**(23 个 MCP 工具 / 批处理 journal / 人工节拍 review)。
+`nx-skill` 提供**手**(24 个 MCP 工具 / 批处理 journal / 人工节拍 review)。
 拼起来 = 把原版"云脑 + 本地手"架构整个换成自己的,而且手比原版更强
 (原版本地只有 3 个工具:`nx-edit-expression` / `nx-expression-query-tool` / `nx-clearance-tool`)。
 
@@ -47,7 +47,7 @@ plchat-local/server.js   /api/ask
    ↓ function calling
 你的模型(Ollama / DeepSeek / 任意 OpenAI 兼容)
    ↓ 工具调用
-nx-skill(23 个 MCP 工具,或直接调 CLI)
+nx-skill(24 个 MCP 工具,或直接调 CLI)
    ├─ 只读/规划 → batch / 离线文档(随便调,零风险)
    └─ 改模型   → review plan.json → 人在 NX 里点(可控、可退、留痕)
 ```

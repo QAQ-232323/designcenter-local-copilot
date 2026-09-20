@@ -14,6 +14,7 @@ const fs = require("fs");
 const path = require("path");
 const url = require("url");
 const { spawn } = require("child_process");
+const { checkBuilderBooleanMembers } = require("./tools/nxopen-builder-check");
 const nxdetect = require("./nxdetect");
 
 const ROOT = __dirname;
@@ -36,11 +37,12 @@ const PRESETS = {
 
 const DEFAULT_SYS = "你是 Siemens Designcenter / NX 的 CAD 助手,用简体中文回答,给可直接照做的步骤。" +
   "涉及本机 NX 环境或 NXOpen API 时,先用工具查证再回答,不要凭记忆猜 API 名。" +
+  "涉及当前打开的零件、已有特征或执行后的结果时,先用 nx_live_status 读取;桥离线或字段不可用时明确说无法核实,不要编造模型状态。" +
   "当用户要一份建模计划时,用 nx_route_intent + nx_modeling_plan 产出分阶段计划,不要只有一步。" +
   "当用户明确表示要把它拿到 NX 里执行时,调用 nx_review_submit 提交计划:步骤名用 NN_Short_Action_Object 编号;" +
   "CAE 求解、保存、导出、布尔、删除、批量改特征这类破坏性步骤一律 gate=manual,参考几何/草图/基本体可用 gate=auto。" +
   "当计划需要 journal 步骤时,你必须自己写出完整的 NXOpen Python 脚本放进 script 字段:脚本必须包含 def main(): ... 以及 if __name__ == '__main__': main() 的入口(执行器用 runpy 以 __main__ 运行它);不要用 f-string(内嵌解释器可能是 Python 2.7),不要依赖第三方库,导入要写全:import NXOpen 不会带出子模块,用到 NXOpen.Features.X / NXOpen.GeometricUtilities.X 就必须显式 import NXOpen.Features / import NXOpen.GeometricUtilities(漏了它,NX 只会说'无法执行 python 脚本');操作当前工作零件(session.Parts.Work),不要调用 Save/Export(那是单独的 manual 步骤);不要自己调用 SetUndoMark / UndoToMark(执行器已为每步建撤销标记);每个提交的对象按 NN_Short_Action_Object 命名,让部件导航器读起来是有序历史;写之前先用 nx_docs_search / nx_docs_member 核对 API 名称与签名,不要凭记忆写;params.path 用形如 02_FLANGE_Bolt_Holes.py 的文件名并与步骤名对应;脚本要短小、单步可诊断。" +
-  "提交后告诉用户去 Designcenter 里点 NX Skill → Review Plan 逐步执行。绝对不要声称你已经执行或已经改动模型。";
+  "提交后告诉用户去 Designcenter 里点 NX Skill → Review Plan 逐步执行。绝对不要声称你已经执行或已经改动模型。执行后再次读取状态,仅在实际证据支持时报告结果。";
 
 function loadRaw() {
   try { return JSON.parse(fs.readFileSync(CFG_PATH, "utf8")); } catch (e) { return {}; }
@@ -706,6 +708,12 @@ const TOOLS = {
       };
     }
   },
+  nx_live_status: {
+    desc: "只读查看当前打开的 NX/Designcenter 工作零件与模型摘要。仅在需要了解当前模型或核对执行结果时调用；桥离线时如实报告。",
+    params: { type: "object", properties: {}, required: [] },
+    args: () => ["live", "status"],
+    compact: (e) => ((e || {}).result || {})
+  },
   nx_docs_search: {
     desc: "在 NX 安装自带的离线 API 文档里按关键字搜索类型/成员(精确对应本机版本,离线)。写 NXOpen 代码前用它核对 API 是否存在。",
     params: { type: "object", properties: { query: { type: "string", description: "关键字,如 ExtrudeBuilder" }, kinds: { type: "string", description: "可选:type / method / property" } }, required: ["query"] },
@@ -723,6 +731,12 @@ const TOOLS = {
     params: { type: "object", properties: { name: { type: "string", description: "完整类型名,如 NXOpen.Features.ExtrudeBuilder" } }, required: ["name"] },
     args: (a) => ["docs", "type", String(a.name || "")],
     compact: (e) => { const r = (e || {}).result || {}; return { type: r.type, memberCount: r.memberCount, members: (r.members || []).slice(0, 12).map(m => ({ name: m.name, kind: m.kind, summary: m.summary, createdIn: m.createdIn })) }; }
+  },
+  nx_docs_samples: {
+    desc: "查找当前 NX 安装自带的官方 NXOpen 示例路径。需要可参考的实现时调用，返回路径不等于已经验证了该示例适用于当前任务。",
+    params: { type: "object", properties: { query: { type: "string", description: "API 类型或操作关键字" } }, required: [] },
+    args: (a) => ["docs", "samples", String(a.query || ""), "--limit", "12"],
+    compact: (e) => ((e || {}).result || {})
   },
   nx_route_intent: {
     desc: "把用户的自然语言请求路由到合适的 NX 应用(建模/CAE/制图等),给出推荐模块与做法指引。收到建模类需求时先调它。",
@@ -805,6 +819,12 @@ TOOLS.nx_review_submit = {
           api.unknown.map(u => "\n  - " + u.token + (u.suggest.length ? "   可能是: " + u.suggest.join(" / ") : "")).join("") +
           "\n请直接用上面给出的名字改掉,然后重新提交;不要再反复搜索 API。");
       }
+      const builder = checkBuilderBooleanMembers(stripNonCode(String(s.script)), nxopenIndex());
+      if (!builder.ok) {
+        throw new Error("步骤 " + steps[i].name + " 的脚本 " + base + " 使用了本机 NXOpen Builder 不存在的布尔成员:" +
+          builder.issues.map(x => "\n  - 第 " + x.line + " 行 " + x.member + "（" + x.type + "）；应使用 " + x.suggestion).join("") +
+          "\n请按当前安装版 API 修正后重新提交。");
+      }
       // 子模块 import 门禁:import NXOpen 不会带出 NXOpen.Features 这类子模块,
       // journal 环境会预加载、live 桥不会 —— 少一行 import 就是"无法执行 python 脚本"。
       const imp = checkNxOpenImports(String(s.script));
@@ -851,8 +871,8 @@ const toolSchemas = () => Object.entries(TOOLS).map(([name, t]) => ({
 /** 每个工具在一次提问里的调用额度。用完就从工具表里摘掉——
  *  实测光靠提示词劝不住模型反复搜索,摘掉工具才是结构性的解法。 */
 const TOOL_LIMITS = {
-  nx_status: 1, nx_route_intent: 1, nx_modeling_plan: 1, nx_visual_spec: 1,
-  nx_docs_search: 2, nx_docs_member: 2, nx_docs_type: 2,   // 刻意收紧:API 名由提交时的门禁负责纠错
+  nx_status: 1, nx_live_status: 2, nx_route_intent: 1, nx_modeling_plan: 1, nx_visual_spec: 1,
+  nx_docs_search: 2, nx_docs_member: 2, nx_docs_type: 2, nx_docs_samples: 1,   // 刻意收紧:API 名由提交时的门禁负责纠错
   nx_review_submit: 4, nx_review_status: 2, nx_review_clear: 1
 };
 
@@ -1037,23 +1057,25 @@ function renderReviewBanner(submitted, stepCount) {
     "或按 <b>Ctrl+Alt+Shift+R</b>。每步可单独撤销、自动截图留痕；计划<b>不会自动运行</b>。</div></div>";
 }
 
-async function answer(question, cfg) {
+async function answer(question, cfg, history = []) {
   const a = active(cfg);
   const trace = [];
   progressStart("chat", question);
   try {
-    return await answerInner(question, cfg, a, trace);
+    return await answerInner(question, cfg, a, trace, history);
   } finally {
     progressEnd("done");
   }
 }
 
-async function answerInner(question, cfg, a, trace) {
+async function answerInner(question, cfg, a, trace, history) {
 
   if (a.id === "mock" && !question) { /* 不会发生 */ }
 
   const messages = [
     { role: "system", content: cfg.systemPrompt || DEFAULT_SYS },
+    { role: "system", content: "本机信息必须以工具返回为准。回答当前工作零件或验证执行结果时调用 nx_live_status；读取失败就明确说无法核实。计划提交只表示已进入复核队列，不代表 NX 执行成功。NXOpen API 名称请先查本机文档。" },
+    ...history,
     { role: "user", content: question }
   ];
   const seen = new Map();     // 去重:同工具同参数不重复执行
@@ -1152,7 +1174,7 @@ async function answerInner(question, cfg, a, trace) {
 
   return {
     html: renderReviewBanner(submitted, stepCount) + toHtml(final) + renderTrace(trace),
-    trace, provider: a.id, model: a.model, reviewSubmitted: submitted, stepCount
+    text: final, trace, provider: a.id, model: a.model, reviewSubmitted: submitted, stepCount
   };
 }
 
@@ -1172,7 +1194,7 @@ async function answerInner(question, cfg, a, trace) {
  *              用到哪个子模块就必须 import 哪个,否则就是 "无法执行 python 脚本,请参见系统日志"
  *              背后藏着的 AttributeError(2026-09-20 实测)。
  */
-const EXAMPLE_RECIPE = ["import math", "import NXOpen", "import NXOpen.Features", "import NXOpen.GeometricUtilities", "", "", "def cylinder(part, x, y, z, dia, h, create):", "    b = part.Features.CreateCylinderBuilder(None)", "    b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "    b.Origin = NXOpen.Point3d(x, y, z)", "    b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "    b.Diameter.RightHandSide = str(dia)", "    b.Height.RightHandSide = str(h)", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    b.BooleanOption.Type = C.Create if create else C.Subtract", "    if not create:", "        bodies = list(part.Bodies)", "        if bodies:", "            b.BooleanOption.SetTargetBodies(bodies)", "    f = b.Commit()", "    b.Destroy()", "    return f", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    if part is None:", "        raise RuntimeError('no work part')", "    f = cylinder(part, 0.0, 0.0, 0.0, 200, 20, True)", "    f.SetName('01_Flange_Disc')", "", "", "if __name__ == '__main__':", "    main()"].join("\n");
+const EXAMPLE_RECIPE = ["import math", "import NXOpen", "import NXOpen.Features", "import NXOpen.GeometricUtilities", "", "", "def cylinder(part, x, y, z, dia, h, create):", "    b = part.Features.CreateCylinderBuilder(None)", "    b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "    b.Origin = NXOpen.Point3d(x, y, z)", "    b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "    b.Diameter.RightHandSide = str(dia)", "    b.Height.RightHandSide = str(h)", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    b.BooleanOption.Type = C.Create if create else C.Subtract", "    if not create:", "        bodies = list(part.Bodies)", "        if not bodies:", "            raise RuntimeError('no target body for subtraction')", "        b.BooleanOption.SetTargetBodies(bodies)", "    f = b.Commit()", "    b.Destroy()", "    return f", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    if part is None:", "        raise RuntimeError('no work part')", "    f = cylinder(part, 0.0, 0.0, 0.0, 200, 20, True)", "    f.SetName('01_Flange_Disc')", "", "", "if __name__ == '__main__':", "    main()"].join("\n");
 const EXAMPLE_PLAN = JSON.stringify({
   prompt: "在法兰盘上做中心通孔和 6 个螺栓孔",
   partPath: "",
@@ -1181,7 +1203,7 @@ const EXAMPLE_PLAN = JSON.stringify({
       params: { path: "01_Create_Flange_Disc.py" }, note: "法兰盘体 OD200 H20", script: EXAMPLE_RECIPE },
     { name: "02_Bolt_Holes_Six", operation: "journal", gate: "manual",
       params: { path: "02_Bolt_Holes_Six.py" }, note: "O160 分度圆上 6xO16 螺栓孔(布尔求差)",
-      script: ["import math", "import NXOpen", "import NXOpen.Features", "import NXOpen.GeometricUtilities", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    for i in range(6):", "        a = 2.0 * math.pi * i / 6.0", "        b = part.Features.CreateCylinderBuilder(None)", "        b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "        b.Origin = NXOpen.Point3d(80.0 * math.cos(a), 80.0 * math.sin(a), -5.0)", "        b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "        b.Diameter.RightHandSide = '16'", "        b.Height.RightHandSide = '30'", "        b.BooleanOption.Type = C.Subtract", "        bodies = list(part.Bodies)", "        if bodies:", "            b.BooleanOption.SetTargetBodies(bodies)", "        f = b.Commit()", "        f.SetName('02_Bolt_Hole_%02d' % (i + 1))", "        b.Destroy()", "", "", "if __name__ == '__main__':", "    main()"].join("\n") },
+      script: ["import math", "import NXOpen", "import NXOpen.Features", "import NXOpen.GeometricUtilities", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    for i in range(6):", "        a = 2.0 * math.pi * i / 6.0", "        b = part.Features.CreateCylinderBuilder(None)", "        b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "        b.Origin = NXOpen.Point3d(80.0 * math.cos(a), 80.0 * math.sin(a), -5.0)", "        b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "        b.Diameter.RightHandSide = '16'", "        b.Height.RightHandSide = '30'", "        b.BooleanOption.Type = C.Subtract", "        bodies = list(part.Bodies)", "        if not bodies:", "            raise RuntimeError('no target body for subtraction')", "        b.BooleanOption.SetTargetBodies(bodies)", "        f = b.Commit()", "        f.SetName('02_Bolt_Hole_%02d' % (i + 1))", "        b.Destroy()", "", "", "if __name__ == '__main__':", "    main()"].join("\n") },
     { name: "03_Review_Screenshot", operation: "screenshot", gate: "manual", params: {}, note: "人工检查" }
   ]
 }, null, 1);
@@ -1196,7 +1218,7 @@ function extractJson(text) {
   try { return JSON.parse(s.slice(a, b + 1)); } catch (e) { return null; }
 }
 
-async function authorPlan(cfg, question, partName) {
+async function authorPlan(cfg, question, partName, sourcePlan = "") {
   const contract = [
     "你是 NX 建模计划生成器。只输出 JSON,不要任何解释、不要 markdown 代码块以外的文字。",
     "输出格式:",
@@ -1213,11 +1235,12 @@ async function authorPlan(cfg, question, partName) {
     "b.Origin = NXOpen.Point3d(x, y, z)  <-- 必须是 Point3d;传 Point 对象或 Vector3d 都会报错;",
     "b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)  <-- 必须是 Vector3d!不要用 part.Directions.CreateDirection(...),它返回 Direction 对象,会报 Expecting NXOpen.Vector3d;",
     "b.Diameter.RightHandSide = 直径字符串 / b.Height.RightHandSide = 高度字符串;",
-    "布尔:b.BooleanOption.Type = NXOpen.GeometricUtilities.BooleanOperation.BooleanType.Create 或 .Subtract;",
+    "布尔:对 CylinderBuilder 使用 b.BooleanOption.Type = NXOpen.GeometricUtilities.BooleanOperation.BooleanType.Create 或 .Subtract;CylinderBuilder 没有 BooleanOperation 属性。不同 Builder 的布尔属性名可能不同,必须按当前安装版 API 核对,不可套用。",
     "求差要给目标体,而且用【方法】:b.BooleanOption.SetTargetBodies(list(part.Bodies)) —— 没有 TargetBodies 这个属性;",
     "提交 f = b.Commit()、命名 f.SetName('NN_Xxx')、清理 b.Destroy()。",
     "",
-    "可用的建模 builder(全部已核验存在,直接用,不要自己造名字):\n  实体  : CreateBlockFeatureBuilder / CreateCylinderBuilder\n  特征  : CreateExtrudeBuilder / CreateRevolveBuilder\n  孔    : CreateHoleFeatureBuilder\n  倒角  : CreateChamferBuilder(对应 NXOpen.Features.ChamferBuilder)\n  圆角  : CreateEdgeBlendBuilder(对应 NXOpen.Features.EdgeBlendBuilder)\n  螺纹  : CreateThreadBuilder\n  统一写法:builder = part.Features.CreateXxxBuilder(None); ... ; f = builder.Commit(); f.SetName('NN_...'); builder.Destroy()\n**不存在**这些名字,别用:NXOpen.Features.SlotBuilder / GrooveBuilder / CountersinkBuilder / Sketches / Datums。\n要做键槽/凹槽/切口(没有专用 builder 的情况下),标准做法是:用一个小实体当刀具 ——\n  建一个 Block 或 Cylinder 放在要切的位置,然后 BooleanOption.Type = ...BooleanType.Subtract,\n  BooleanOption.TargetBodies = list(part.Bodies)。这和中心通孔的做法完全一样,只是把圆柱换成方块。\n倒角/圆角需要先选中边:用 part.Edges 或从已建对象的 body 上取边赋给 builder 的对应属性;\n拿不准某个属性名时,先调 nx_docs_member 查一次,不要猜。",
+    "可用的建模 builder(全部已核验存在,直接用,不要自己造名字):\n  实体  : CreateBlockFeatureBuilder / CreateCylinderBuilder\n  特征  : CreateExtrudeBuilder / CreateRevolveBuilder\n  孔    : CreateHoleFeatureBuilder\n  倒角  : CreateChamferBuilder(对应 NXOpen.Features.ChamferBuilder)\n  圆角  : CreateEdgeBlendBuilder(对应 NXOpen.Features.EdgeBlendBuilder)\n  螺纹  : CreateThreadBuilder\n  统一写法:builder = part.Features.CreateXxxBuilder(None); ... ; f = builder.Commit(); f.SetName('NN_...'); builder.Destroy()\n**不存在**这些名字,别用:NXOpen.Features.SlotBuilder / GrooveBuilder / CountersinkBuilder / Sketches / Datums。\n要做键槽/凹槽/切口(没有专用 builder 的情况下),标准做法是:用一个小实体当刀具 ——\n  建一个 Block 或 Cylinder 放在要切的位置,然后 b.BooleanOption.Type = ...BooleanType.Subtract,\n  b.BooleanOption.SetTargetBodies(list(part.Bodies))。没有 BooleanOption.TargetBodies 属性;目标体列表为空时不要提交求差。\n倒角/圆角需要先选中边:用 part.Edges 或从已建对象的 body 上取边赋给 builder 的对应属性;\n拿不准某个属性名时,先调 nx_docs_member 查一次,不要猜。",
+    "注意:上面 BooleanOption 的布尔示例只适用于 CylinderBuilder；BlockBuilder、ExtrudeBuilder 等必须分别查询本机 API,不能照搬成员名。",
     "倒角(实测最容易踩坑):NXOpen.Features.ChamferBuilder.ChamferOption 的合法取值是 SymmetricOffsets / TwoOffsets / OffsetAndAngle —— 没有 Symmetric。写法:cb = part.Features.CreateChamferBuilder(None); cb.Option = NXOpen.Features.ChamferBuilder.ChamferOption.SymmetricOffsets; cb.FirstOffset.RightHandSide = '2'; 设好边集后 cb.Commit()。如果边集(SmartCollector)用法无法确证,就不要写这一步:降级为 operation=noop、gate=manual,note 里写明让用户手工倒角。任何无法确证成员名的特征,一律降级为 manual 人工步骤 —— 宁少一步也不写错。",
     "下面是一份**已通过全部校验的真实样例**。**只学它的写法与结构,尺寸/特征/步骤数必须按用户实际需求来,严禁照抄样例内容。**",
     EXAMPLE_PLAN
@@ -1225,7 +1248,8 @@ async function authorPlan(cfg, question, partName) {
 
   const messages = [
     { role: "system", content: contract },
-    { role: "user", content: "需求:" + question + (partName ? "\n零件名:" + partName : "") }
+    { role: "user", content: "需求:" + question + (partName ? "\n零件名:" + partName : "") +
+      (sourcePlan ? "\n\n以下是聊天中已经讨论的计划草稿。请保留其中符合原始需求的步骤、尺寸与约束，再按上面的 JSON 契约生成可复核计划；草稿不代表脚本已校验或已执行：\n" + String(sourcePlan).slice(0, 12000) : "") }
   ];
 
   progressStart("author", question);
@@ -1244,7 +1268,7 @@ async function authorPlan(cfg, question, partName) {
     }
     progressStage("validating", "校验脚本语法与 NXOpen API 名…");
     const res = await execTool(cfg, "nx_review_submit", {
-      prompt: plan.prompt || question, partPath: plan.partPath || "", steps: plan.steps
+      prompt: sourcePlan ? question : (plan.prompt || question), partPath: plan.partPath || "", steps: plan.steps
     });
     progressTool("nx_review_submit", { attempt: attempt }, res);
     if (res.ok) {
@@ -1314,13 +1338,20 @@ const server = http.createServer(async (req, res) => {
   /* ---- 聊天后端 ---- */
   if (req.method === "POST" && parsed.pathname === "/api/ask") {
     readBody(req, async (raw) => {
-      let q = ""; try { q = JSON.parse(raw || "{}").question || ""; } catch (e) { }
+      let q = "", history = [];
+      try {
+        const body = JSON.parse(raw || "{}");
+        q = String(body.question || "").slice(0, 12000);
+        if (Array.isArray(body.history)) history = body.history.slice(-8)
+          .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+          .map(m => ({ role: m.role, content: m.content.slice(0, 4000) }));
+      } catch (e) { }
       const cfg = loadConfig();
       const t0 = Date.now();
       try {
-        const a = await answer(q, cfg);
+        const a = await answer(q, cfg, history);
         console.log("[ask] 问题:" + q.slice(0, 40) + " | 供应商:" + a.provider + " | 工具:" + a.trace.length + " | " + (Date.now() - t0) + "ms");
-        sendJson(res, { data: { answer: a.html }, meta: { provider: a.provider, model: a.model, ms: Date.now() - t0, tools: a.trace.length, reviewSubmitted: !!a.reviewSubmitted, stepCount: a.stepCount || null } });
+        sendJson(res, { data: { answer: a.html, text: a.text }, meta: { provider: a.provider, model: a.model, ms: Date.now() - t0, tools: a.trace.length, reviewSubmitted: !!a.reviewSubmitted, stepCount: a.stepCount || null } });
       } catch (e) {
         sendJson(res, { data: { answer: "<p><b>后端出错:</b>" + esc(e.message) + "</p>" }, meta: { ms: Date.now() - t0 } });
       }
@@ -1530,7 +1561,7 @@ const server = http.createServer(async (req, res) => {
       const t0 = Date.now();
       const run = async () => {
         try {
-          const out = await authorPlan(loadConfig(), b.question || "", b.partName || "");
+          const out = await authorPlan(loadConfig(), b.question || "", b.partName || "", b.sourcePlan || "");
           console.log("[author] " + (out.ok ? "成功 第" + out.attempt + "次 计划 " + out.planId : "失败: " + out.error) + " | " + (Date.now() - t0) + "ms");
           return Object.assign({ ms: Date.now() - t0 }, out);
         } catch (e) {
@@ -1599,7 +1630,8 @@ const server = http.createServer(async (req, res) => {
         indexSize: idx.size,
         syntax: (() => { const fsx = require("fs"), osx = require("os"); const f = path.join(osx.tmpdir(), "precheck_" + Date.now() + ".py"); fsx.writeFileSync(f, src, "utf8"); const r = require("child_process").spawnSync("python", ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", f], { encoding: "utf8", windowsHide: true }); try { fsx.unlinkSync(f); } catch (e) { } return r.status === 0 ? { ok: true } : { ok: false, error: ((r.stderr || "") + (r.stdout || "")).trim().split("\n").slice(-5).join("\n") }; })(),
         api: checkNxOpenNames(src),
-        imports: checkNxOpenImports(src)
+        imports: checkNxOpenImports(src),
+        builder: checkBuilderBooleanMembers(stripNonCode(src), idx)
       });
     });
     return;

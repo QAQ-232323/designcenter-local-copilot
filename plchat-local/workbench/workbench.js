@@ -4,7 +4,8 @@
   const $ = id => document.getElementById(id);
   const state = { settings: null, review: null, online: false, busy: false, remoteBusy: false,
     settingsBusy: false, dirty: false, drafts: new Map(), logs: [], toolsSeen: new Set(),
-    job: null, jobPolling: false, polling: false, lastReview: '', lastStage: '', lastProgressError: false };
+    job: null, jobPolling: false, polling: false, lastReview: '', lastStage: '', lastProgressError: false,
+    history: [], pendingPlanButton: null };
   const JOB_KEY = 'dc-workbench-job-v1';
   const stages = { thinking: '模型正在组织回答', streaming: '正在接收回答', tool: '正在查询工具',
     authoring: '正在生成建模计划', validating: '正在检查脚本', retry: '正在修正计划',
@@ -50,6 +51,7 @@
   function syncControls() {
     const locked = state.busy || state.remoteBusy || state.settingsBusy || !!state.job;
     document.querySelectorAll('[data-mutation]').forEach(el => { el.disabled = locked || !state.online || !state.settings; });
+    document.querySelectorAll('.chat-plan-button').forEach(el => { el.disabled = locked || !state.online || el.dataset.added === 'true'; });
     const runnable = state.review?.hasPlan && state.review.steps?.some(s => s.operation === 'journal');
     document.querySelectorAll('[data-run]').forEach(el => { el.disabled = locked || !state.online || !runnable; });
     $('clear-plan').disabled = locked || !state.online || !state.review?.hasPlan;
@@ -248,15 +250,50 @@
     article.append(node('div', 'message-avatar', role === 'user' ? '你' : 'AI'), content); $('messages').append(article);
     $('messages').scrollTop = $('messages').scrollHeight; return article;
   }
+  function isPlanReply(question, answer) {
+    if (typeof answer !== 'string' || !answer.trim()) return false;
+    const asksForPlan = /计划|方案|步骤|建模|怎么做|如何做|plan|steps/i.test(question);
+    const hasPlanTitle = /(?:^|\n)\s*(?:#{1,4}\s*)?(?:建模计划|实施计划|执行计划|设计方案|操作步骤|plan\b)/im.test(answer);
+    const numberedSteps = (answer.match(/(?:^|\n)\s*(?:\d+[.、)]|第[一二三四五六七八九十]+步|步骤\s*\d+)/gm) || []).length;
+    return (asksForPlan && (hasPlanTitle || numberedSteps >= 2)) || (hasPlanTitle && numberedSteps >= 2);
+  }
+  async function addChatPlan(question, draft, button) {
+    if (button.disabled || state.busy || state.remoteBusy || state.job) return;
+    setBusy(true, '正在检查复核队列');
+    try {
+      await refreshReview();
+      if (state.review?.hasPlan && !await dialog('替换当前计划？', '把这条聊天计划加入右侧复核队列会替换当前计划及复核进度。新计划仍需校验和人工复核。', '生成并替换')) return;
+      text('activity-text', '正在把聊天计划加入复核队列');
+      log('计划', '已从聊天回复发起计划生成与校验。');
+      const result = requireOK(await api('/api/plan/author', { question, sourcePlan: draft }, 30000));
+      if (!result.jobId) throw new Error('宿主未返回任务编号，请检查复核队列。');
+      state.pendingPlanButton = button;
+      rememberJob({ id: result.jobId, kind: 'author', source: 'chat', started: Date.now() });
+      await pollJob();
+    } catch (e) { log('计划', e.message, true); toast(e.message); }
+    finally { setBusy(false); }
+  }
   async function ask(event) {
     event?.preventDefault(); if ($('send-message').disabled) return;
     const question = $('prompt').value.trim(); if (!question) { $('prompt').focus(); toast('请先输入问题或建模需求。'); return; }
     message('user', question); $('prompt').value = ''; setBusy(true, '正在发送问题'); log('对话', '已发送问题，等待模型返回。');
     try {
-      const result = await api('/api/ask', { question }, 900000);
+      const result = await api('/api/ask', { question, history: state.history }, 900000);
       if (!result.data || typeof result.data.answer !== 'string') throw new Error('回答格式异常，请查看宿主日志。');
       const meta = result.meta || {};
-      message('assistant', result.data.answer, true, [meta.model, meta.ms != null ? (meta.ms / 1000).toFixed(1) + ' s' : '', meta.tools != null ? meta.tools + ' 次工具调用' : ''].filter(Boolean).join(' · '));
+      const reply = message('assistant', result.data.answer, true, [meta.model, meta.ms != null ? (meta.ms / 1000).toFixed(1) + ' s' : '', meta.tools != null ? meta.tools + ' 次工具调用' : ''].filter(Boolean).join(' · '));
+      if (meta.provider && !meta.reviewSubmitted && isPlanReply(question, result.data.text)) {
+        const actions = node('div', 'message-actions');
+        const button = node('button', 'button chat-plan-button', '加入计划');
+        button.type = 'button'; button.title = '根据这条聊天计划生成、校验并加入右侧复核队列';
+        button.addEventListener('click', () => addChatPlan(question, result.data.text, button));
+        actions.append(button); reply.querySelector('.message-main').append(actions);
+        syncControls();
+      }
+      if (meta.provider && typeof result.data.text === 'string') {
+        state.history.push({ role: 'user', content: question }, { role: 'assistant', content: result.data.text });
+        state.history = state.history.slice(-8);
+      }
       log('对话', meta.provider ? '已收到模型回答。' : '宿主返回错误说明，请查看对话。', !meta.provider);
       if (meta.reviewSubmitted) { await refreshReview(); toast('计划已提交，右侧可查看复核步骤。'); }
     } catch (e) { message('assistant', e.message); log('对话', e.message, true); }
@@ -267,6 +304,62 @@
     text('dialog-title', title); text('dialog-body', body); text('dialog-confirm', confirmLabel);
     $('dialog-cancel').hidden = info; $('action-dialog').returnValue = 'cancel'; $('action-dialog').showModal();
     return new Promise(resolve => { $('action-dialog').addEventListener('close', () => resolve($('action-dialog').returnValue === 'confirm'), { once: true }); });
+  }
+  const workspaceDialog = $('workspace-dialog');
+  let windowedPanel = null;
+  let panelPlaceholder = null;
+  let windowOpener = null;
+  function restoreWindowPanel() {
+    if (windowedPanel && panelPlaceholder) panelPlaceholder.replaceWith(windowedPanel);
+    windowedPanel = null; panelPlaceholder = null;
+  }
+  function closeWorkspaceWindow() { if (workspaceDialog.open) workspaceDialog.close(); }
+  workspaceDialog.addEventListener('close', () => {
+    if (!workspaceDialog.open) {
+      restoreWindowPanel();
+      if (windowOpener?.isConnected) windowOpener.focus();
+      windowOpener = null;
+    }
+  });
+  $('workspace-dialog-close').addEventListener('click', closeWorkspaceWindow);
+  function openWorkspaceWindow(title, surface, panelId, focusId = '', mode = '') {
+    const opener = document.activeElement;
+    if (workspaceDialog.open) { workspaceDialog.close(); restoreWindowPanel(); }
+    windowOpener = opener;
+    workspaceDialog.dataset.surface = surface;
+    workspaceDialog.dataset.mode = mode || (surface === 'plan' && focusId === 'run-live' ? 'live'
+      : surface === 'plan' && focusId === 'run-batch' ? 'batch' : '');
+    text('workspace-dialog-title', title);
+    const body = $('workspace-dialog-body');
+    body.replaceChildren();
+    if (panelId) {
+      const panel = $(panelId);
+      panelPlaceholder = node('div', 'panel-placeholder ' + (panelId === 'configuration' ? 'configuration' : panelId === 'plan-panel' ? 'plan-panel' : ''), '内容已在独立窗口打开');
+      panel.before(panelPlaceholder);
+      body.append(panel);
+      windowedPanel = panel;
+    }
+    workspaceDialog.showModal();
+    if (focusId && !$(focusId).disabled) $(focusId).focus();
+    else $('workspace-dialog-close').focus();
+    return body;
+  }
+  function openStatusWindow() {
+    const body = openWorkspaceWindow('连接与运行状态', 'status');
+    const content = node('section', 'window-content'); body.append(content);
+    const draw = () => {
+      content.replaceChildren(node('h3', '', '当前工作台状态'));
+      for (const [label, value] of [
+        ['本地宿主', $('host-label').textContent], ['当前模型', $('active-model').textContent],
+        ['NX 环境', $('nx-status').textContent], ['复核队列', $('plan-name').textContent],
+        ['工作区', $('footer-workspace').textContent]
+      ]) content.append(node('p', '', label + '：' + value));
+      const refresh = node('button', 'button primary', '重新读取状态'); refresh.type = 'button';
+      refresh.addEventListener('click', async () => { refresh.disabled = true; await refreshAll(); draw(); });
+      content.append(refresh);
+    };
+    draw();
+    refreshAll().then(draw);
   }
   function rememberJob(job) {
     state.job = job; try { if (job) sessionStorage.setItem(JOB_KEY, JSON.stringify(job)); else sessionStorage.removeItem(JOB_KEY); } catch (_) { /* Storage can be disabled inside webviews. */ }
@@ -324,8 +417,11 @@
     rememberJob(null);
     const output = result.result || { ok: false, error: '任务结束，但没有返回结果。' };
     if (job.kind === 'author') {
-      if (output.ok) { message('assistant', '建模计划已生成并提交到复核队列，共 ' + output.stepCount + ' 步。请在右侧检查步骤，在 NX Skill → Review Plan 中逐步复核。'); log('计划', '生成完成：' + output.planId + '，' + output.stepCount + ' 步。'); }
+      if (output.ok) { message('assistant', '建模计划已生成并提交到复核队列，共 ' + output.stepCount + ' 步。请在右侧检查步骤，在 NX Skill → Review Plan 中逐步复核。'); log('计划', '生成完成：' + output.planId + '，' + output.stepCount + ' 步。');
+        if (job.source === 'chat' && state.pendingPlanButton) { state.pendingPlanButton.textContent = '已加入计划'; state.pendingPlanButton.dataset.added = 'true'; }
+      }
       else { const error = output.error || '计划生成失败'; message('assistant', error); log('计划', error, true); }
+      state.pendingPlanButton = null;
     } else renderRun(output, job);
     try { await refreshReview(); } catch (e) { log('队列', e.message, true); }
     finally { state.jobPolling = false; syncControls(); }
@@ -392,12 +488,23 @@
   $('provider').addEventListener('focus', snapshotDraft);
   $('clear-key').addEventListener('change', () => { $('api-key').disabled = $('clear-key').checked; dirty(); });
   $('test-connection').addEventListener('click', testConnection); $('check-environment').addEventListener('click', checkEnvironment);
-  $('author-plan').addEventListener('click', author); $('ribbon-author').addEventListener('click', author);
+  $('author-plan').addEventListener('click', author);
   document.querySelectorAll('[data-run]').forEach(el => el.addEventListener('click', () => run(el.dataset.run)));
   document.querySelectorAll('[data-prompt]').forEach(el => el.addEventListener('click', () => { $('prompt').value = el.dataset.prompt; $('prompt').focus(); }));
-  $('focus-prompt').addEventListener('click', () => $('prompt').focus());
-  $('focus-settings').addEventListener('click', () => { $('configuration').scrollIntoView({ block: 'nearest' }); $('provider').focus(); });
-  $('refresh-all').addEventListener('click', refreshAll);
+  $('focus-prompt').addEventListener('click', () => openWorkspaceWindow('输入需求', 'chat', 'chat-panel', 'prompt'));
+  $('ribbon-author').addEventListener('click', () => openWorkspaceWindow('生成计划', 'chat', 'chat-panel', 'prompt'));
+  $('focus-settings').addEventListener('click', () => openWorkspaceWindow('模型配置', 'settings', 'configuration', 'provider'));
+  document.querySelectorAll('[data-open-panel]').forEach(el => el.addEventListener('click', () => {
+    const panel = el.dataset.openPanel;
+    if (panel === 'chat') openWorkspaceWindow('Copilot 对话', 'chat', 'chat-panel', 'prompt');
+    else if (panel === 'plan') openWorkspaceWindow('计划与复核', 'plan', 'plan-panel');
+    else openWorkspaceWindow('连接配置', 'settings', 'configuration', 'provider');
+  }));
+  document.querySelectorAll('[data-open-run]').forEach(el => el.addEventListener('click', () => {
+    const live = el.dataset.openRun === 'live';
+    openWorkspaceWindow(live ? '当前会话执行' : '后台新建零件', 'plan', 'plan-panel', live ? 'run-live' : 'run-batch');
+  }));
+  $('refresh-all').addEventListener('click', openStatusWindow);
   $('refresh-plan').addEventListener('click', async () => { try { await refreshReview(); toast('复核队列已刷新。'); } catch (e) { toast(e.message); } });
   $('clear-plan').addEventListener('click', clearPlan);
   $('export-plan').addEventListener('click', () => { if (state.review?.hasPlan) download('plan-summary.json', JSON.stringify({ ...state.review, exportNote: '计划与复核状态摘要，不包含可执行脚本。' }, null, 2), 'application/json'); });
@@ -406,10 +513,11 @@
   $('new-chat').addEventListener('click', async () => {
     if (state.busy || state.remoteBusy || state.job) return;
     if ($('messages').querySelector('.message') && !await dialog('新建对话？', '将清除当前页面的对话记录。复核计划与 NX 零件保持不变。', '新建对话')) return;
-    $('messages').querySelectorAll('.message').forEach(el => el.remove()); $('welcome').hidden = false; $('prompt').value = ''; $('prompt').focus();
+    $('messages').querySelectorAll('.message').forEach(el => el.remove()); state.history = []; state.pendingPlanButton = null; $('welcome').hidden = false; $('prompt').value = ''; $('prompt').focus();
+    openWorkspaceWindow('新建对话', 'chat', 'chat-panel', 'prompt');
   });
-  $('help-button').addEventListener('click', () => dialog('本地工作台使用说明', '1. 在左侧配置模型，点击“保存并启用”。\n2. 在中间输入需求：发送用于问答，生成计划会提交到右侧复核队列。当前问答接口每次独立处理，请在追问中补充必要上下文。\n3. 在 NX 中打开 NX Skill → Review Plan，可逐步执行并复核。\n4. 自动执行可选择当前会话或后台新建零件，具体行为会在执行前说明。\n\n本页对话和日志仅保留在当前页面。生成计划和静态检查不代表零件已经建成。', '知道了', true));
-  $('review-guide').addEventListener('click', () => dialog('在 NX 中人工复核', '在 Designcenter 中打开 NX Skill → Review Plan。\n\n检查每一步，点击“下一步”执行；连续自动执行会在人工确认步骤前停止。完成后点击本页“刷新状态”查看记录。\n\n网页不能替代 NX 中的人工复核按钮。', '知道了', true));
+  $('help-button').addEventListener('click', () => dialog('本地工作台使用说明', '顶部导航和快捷操作会打开对应的独立操作窗口，关闭后可回到工作台，未提交的输入会保留。\n1. 在“模型配置”窗口设置供应商，点击“保存并启用”。\n2. 在“输入需求”窗口发送问题；计划类聊天回复下可点“加入计划”，经生成与校验后提交复核队列。也可在“生成计划”窗口直接生成。聊天会携带最近四轮问答，新建对话会清空上下文。\n3. 在 NX 中打开 NX Skill → Review Plan，可逐步执行并复核。\n4. 两种自动执行方式各有操作窗口，执行前仍需确认。\n\n本页对话和日志仅保留在当前页面。生成计划和静态检查不代表零件已经建成。', '知道了', true));
+  $('review-guide').addEventListener('click', () => openWorkspaceWindow('人工复核', 'plan', 'plan-panel', '', 'review'));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
   window.addEventListener('beforeunload', event => { if (state.busy || state.dirty) { event.preventDefault(); event.returnValue = ''; } });
   try { const saved = JSON.parse(sessionStorage.getItem(JOB_KEY)); if (saved?.id && ['author', 'run'].includes(saved.kind)) { state.job = saved; log('任务', '恢复任务状态查询：' + saved.id); } } catch (_) { /* Empty or disabled storage. */ }

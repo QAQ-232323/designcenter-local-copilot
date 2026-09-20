@@ -167,7 +167,7 @@ nx-skill plan "build a bracket" --part-name Bracket
 
 ## Tools
 
-23 MCP tools, all returning the same envelope.
+24 MCP tools, all returning the same envelope.
 
 | Group | Tools |
 |---|---|

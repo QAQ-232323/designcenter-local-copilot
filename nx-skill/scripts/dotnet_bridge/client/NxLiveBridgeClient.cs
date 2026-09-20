@@ -160,6 +160,76 @@ public class NxLiveBridgeClient
         result["applicationName"] = SafeString(delegate { return session.ApplicationName; });
         result["workPart"] = PartInfo(session.Parts.Work);
         result["displayPart"] = PartInfo(session.Parts.Display);
+        // Keep inspection read-only and bounded. Different NX releases expose
+        // different collections, so missing members are reported, not guessed.
+        if (session.Parts.Work != null)
+        {
+            result["model"] = ModelInfo(session.Parts.Work);
+        }
+        return result;
+    }
+
+    private static Dictionary<string, object> ModelInfo(BasePart basePart)
+    {
+        Dictionary<string, object> model = new Dictionary<string, object>();
+        Part part = basePart as Part;
+        if (part == null)
+        {
+            model["available"] = false;
+            model["reason"] = "Work Part is not a modeling Part";
+            return model;
+        }
+        model["available"] = true;
+        model["units"] = SafeProperty(part, "PartUnits");
+        model["features"] = CollectionInfo(part, "Features", true);
+        model["bodies"] = CollectionInfo(part, "Bodies", false);
+        model["expressions"] = CollectionInfo(part, "Expressions", false);
+        return model;
+    }
+
+    private static string SafeProperty(object target, string name)
+    {
+        try
+        {
+            PropertyInfo property = target.GetType().GetProperty(name);
+            object value = property == null ? null : property.GetValue(target, null);
+            return value == null ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+        catch (Exception) { return null; }
+    }
+
+    private static Dictionary<string, object> CollectionInfo(object part, string propertyName, bool includeNames)
+    {
+        Dictionary<string, object> result = new Dictionary<string, object>();
+        result["available"] = false;
+        try
+        {
+            PropertyInfo property = part.GetType().GetProperty(propertyName);
+            object collection = property == null ? null : property.GetValue(part, null);
+            if (collection == null) return result;
+            MethodInfo toArray = collection.GetType().GetMethod("ToArray", Type.EmptyTypes);
+            IEnumerable items = toArray == null ? collection as IEnumerable : toArray.Invoke(collection, null) as IEnumerable;
+            if (items == null) return result;
+            int count = 0;
+            List<string> names = new List<string>();
+            foreach (object item in items)
+            {
+                count++;
+                if (includeNames && names.Count < 100)
+                {
+                    string name = SafeProperty(item, "Name");
+                    if (!String.IsNullOrEmpty(name)) names.Add(name);
+                }
+            }
+            result["available"] = true;
+            result["count"] = count;
+            if (includeNames)
+            {
+                result["names"] = names;
+                result["namesTruncated"] = count > 100;
+            }
+        }
+        catch (Exception ex) { result["reason"] = ex.Message; }
         return result;
     }
 

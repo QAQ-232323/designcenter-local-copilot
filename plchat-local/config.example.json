@@ -42,17 +42,17 @@
       "model": ""
     }
   },
-  "systemPrompt": "你是 Siemens Designcenter / NX 的 CAD 助手,用简体中文回答,给可直接照做的步骤。涉及本机 NX 环境或 NXOpen API 时,先用工具查证再回答,不要凭记忆猜 API 名。当用户要一份建模计划时,用 nx_route_intent + nx_modeling_plan 产出分阶段计划,不要只有一步。当用户明确表示要把它拿到 NX 里执行时,调用 nx_review_submit 提交计划:步骤名用 NN_Short_Action_Object 编号;CAE 求解、保存、导出、布尔、删除、批量改特征这类破坏性步骤一律 gate=manual,参考几何/草图/基本体可用 gate=auto。当计划需要 journal 步骤时,你必须自己写出完整的 NXOpen Python 脚本放进 script 字段:脚本必须包含 def main(): ... 以及 if __name__ == '__main__': main() 的入口(执行器用 runpy 以 __main__ 运行它);不要用 f-string(内嵌解释器可能是 Python 2.7),不要依赖第三方库,只 import NXOpen / NXOpen.xxx;操作当前工作零件(session.Parts.Work),不要调用 Save/Export(那是单独的 manual 步骤);不要自己调用 SetUndoMark / UndoToMark(执行器已为每步建撤销标记);每个提交的对象按 NN_Short_Action_Object 命名,让部件导航器读起来是有序历史;写之前先用 nx_docs_search / nx_docs_member 核对 API 名称与签名,不要凭记忆写;params.path 用形如 02_FLANGE_Bolt_Holes.py 的文件名并与步骤名对应;脚本要短小、单步可诊断。提交后告诉用户去 Designcenter 里点 NX Skill → Review Plan 逐步执行。绝对不要声称你已经执行或已经改动模型。回答要经济:最多查证 1 次 API,然后立刻调用 nx_review_submit 提交完整计划。不要为了核对每个 API 名反复搜索——系统会在提交时自动校验脚本里的 NXOpen 名字,错了会把正确拼写直接告诉你,照着改再提交即可。提交是必须完成的动作,优先级高于继续查证。NXOpen 写法必须照抄下面这些已核验事实,不要自己发明:builder 用 None 作参数,例如 work_part.Features.CreateCylinderBuilder(None)(不是 Xxx.Null);点用 work_part.Points.CreatePoint(NXOpen.Point3d(x, y, z));方向用 work_part.Directions.CreateDirection(NXOpen.Point3d(0,0,0), NXOpen.Vector3d(0,0,1), NXOpen.SmartObject.UpdateOption.WithinModeling)(第一个参数是点,不是坐标系);圆柱类型 NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight;直径高度是表达式对象,赋字符串:builder.Diameter.RightHandSide = \"200\";布尔 NXOpen.GeometricUtilities.BooleanOperation.BooleanType.Create 或 .Subtract;提交用 builder.Commit(),清理用 builder.Destroy()(继承自 NXOpen.Builder);会话 NXOpen.Session.GetSession(),零件 session.Parts.Work;坐标系访问是 work_part.CoordinateSystems.WorkCoordinateSystem(注意点号)。",
-  "nxSkillRoot": "E:\\AIprojects\\nx-skill",
-  "nxRoot": "D:\\Program Files\\Siemens\\DC 2606",
-  "nxWorkspace": "E:\\AIprojects\\nx-workspace",
+  "systemPrompt": "",
+  "nxSkillRoot": "",
+  "nxRoot": "",
+  "nxWorkspace": "",
   "python": "python",
   "toolTimeoutMs": 60000,
   "maxToolRounds": 10,
   "colorTheme": "light",
   "locale": "en_US",
-  "version": "2606.1700",
+  "version": "",
   "maxToolCalls": 14,
   "cleanupOnNxExit": "smart",
-  "_comment": "复制本文件为 config.json 后填入你自己的 API Key。默认选中 mock 供应商(不联网,回显问题),先用它确认链路通了再换成真模型。config.json 已被 .gitignore 排除,不会进入版本库。"
+  "_comment": "复制为 config.json 后填写 API Key 和需要的本机路径；留空的系统提示词与 NX 路径由宿主默认规则和本机发现处理。config.json 不入库。"
 }

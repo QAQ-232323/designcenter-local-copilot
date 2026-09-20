@@ -1,8 +1,22 @@
 # Designcenter 2606 本地 Copilot 工作台与原版页面
 
+这是一个社区项目，用本地 Node.js 宿主连接自选模型与 `nx-skill`，为 Siemens Designcenter / NX 提供聊天、建模计划、人工复核和执行入口。仓库只包含项目自写代码；使用者须在自己的已授权安装中运行 NX，并自行配置模型服务。项目与 Siemens 无隶属关系。
+
 > **本地工作台（新首页）**：启动 `plchat-local/start.cmd` 或在该目录运行 `node server.js 8765`，打开 `http://127.0.0.1:8765/`。新页面把模型配置、聊天、建模计划、复核状态和执行日志放在同一页，使用现有本地 API，不依赖重建官方前端。原版页面保留在 `/legacy.html`，需要先运行 `fetch-frontend.sh` 重建本机已授权的前端资源才能使用。
 
+Windows 快速启动：安装 Node.js 和 Python，双击 `plchat-local/start.cmd`；需要使用真实模型时，将 `plchat-local/config.example.json` 复制为 `config.json`，在工作台“连接配置”中填写服务地址、模型和自己的密钥。默认 `mock` 供应商仅用于检查页面与宿主是否连通。NX 能力需要本机已安装并有权使用的 Designcenter / NX；配置与密钥文件已被 `.gitignore` 排除。
+
 本地工作台的“生成计划”会提交复核队列；在 NX 中打开 **NX Skill → Review Plan** 可逐步检查和执行。工作台另提供 Live 与 Batch 自动执行，两者会执行 journal 步骤，**不会按计划中的 `gate=manual` 逐步暂停**；点击前会显示执行目标和确认提示。是否真正建模成功须以 NX 的执行结果为准。
+
+工作台聊天会在当前页面会话中携带最近四轮问答，供模型理解“刚才那个零件”等后续指代；刷新页面会清空这段历史。涉及当前零件时，模型可以调用只读的 `nx_live_status`。新版实时桥客户端会尝试返回工作零件的单位、特征名称与数量、实体与表达式数量；各字段都有 `available` 标记，缺失或桥离线不代表零件为空。更新源码后，运行 `nx-skill/scripts/build_dotnet_bridge.ps1 -ClientOnly` 重建客户端，才会获得新增的模型摘要。
+
+聊天回复若包含计划结构，会在该条回复下显示“加入计划”。点击后以原始需求和聊天草稿生成经过现有脚本校验的复核计划，成功后出现在右侧；已有计划时先提示替换。聊天稿本身不是可执行脚本，按钮不会立即修改 NX 零件。
+
+顶部快捷操作和“对话 / 计划与复核 / 连接配置”导航现在打开各自的页面内工作窗口。输入需求与生成计划打开对话窗口，人工复核及两种执行方式打开对应的计划窗口，模型配置打开配置窗口，刷新状态打开状态窗口；关闭后原有内容与编辑状态回到工作台。执行仍需在窗口内点击执行按钮并确认。
+
+`nx-skill` 的 MCP 服务继续使用 `python -m nx_skill.mcp`。它现在提供 `nx-skill://guide/workflow` 资源、`nx_model_task` 提示模板和只读 `nx_live_verify` 工具。验证工具根据实际读取的零件路径、最少特征数或特征名称核对明确预期；读取不到时返回 `verified=false`。这些接口通过能力发现适配不同安装，不依赖固定版本或模型文件。CAE 求解与保存仍须以各自真实执行记录为准。
+
+提交计划时会先校验脚本语法、NXOpen 名称、子模块导入及 Builder 布尔成员。布尔属性按本机 NXOpen 索引和具体 Builder 类型核对，例如 `CylinderBuilder.BooleanOption` 与 `ExtrudeBuilder.BooleanOperation` 不可混用；预检只减少可识别的脚本错误，不代表 NX 已成功执行。
 
 把 Siemens Designcenter / NX **内置的 Copilot 页面**在本地宿主里跑起来,后端换成你自己的模型,
 再通过 [nx-skill](nx-skill/)(本仓库子项目)让它**真的能建模** —— 出计划、过门禁、在 NX 里执行。
@@ -12,8 +26,8 @@
 | | |
 |---|---|
 | `plchat-local/` | 本地宿主:页面桥 + 多供应商后端 + 计划生成 / 静态门禁 / 执行编排 |
-| `nx-skill/` | **子项目**:NXOpen 技能包 —— Python 包 + CLI + MCP server(23 个工具)/ 批处理 journal / 人工节拍 review,外加 NX 侧菜单与 .NET 实时桥 |
-| `README.md` | 从"页面为什么点不动"到"live 模式为什么连不上"的完整踩坑记录(18 节) |
+| `nx-skill/` | **子项目**:NXOpen 技能包 —— Python 包 + CLI + MCP server(24 个工具)/ 批处理 journal / 人工节拍 review,外加 NX 侧菜单与 .NET 实时桥 |
+| `README.md` | 从页面启动到 live 模式排障的使用与开发记录 |
 | `FUSION-nx-skill.md` | 两者融合的设计(脸 / 脑 / 手分层, P0–P3 实施分级) |
 
 **这个仓库里没有什么**
@@ -279,7 +293,7 @@ bash fetch-frontend.sh --skip-cdn # 只从本机安装取页面脚本, 完全不
 
 | 维度 | 官方内置工具通道 | 直接调 nx-skill |
 |---|---|---|
-| 工具数 | 3 个(`nx-edit-expression` / `nx-expression-query-tool` / `nx-clearance-tool`)+ 1 个 NXOpen 代码工具 | **7 个已接 + 共 23 个可用** |
+| 工具数 | 3 个(`nx-edit-expression` / `nx-expression-query-tool` / `nx-clearance-tool`)+ 1 个 NXOpen 代码工具 | **聊天后端 12 个已接 + MCP 共 24 个可用** |
 | 可扩展 | 否,DLL 里写死 | 开源,随时加 |
 | 协议 | 闭源 WebSocket `agent/socket`;`{requestId,toolId,toolParameters}` → `{result,requestId}`;还需 agentMetadata(`agentId/activeTools/context/dev`) | 开放:CLI / MCP stdio,契约有测试 |
 | 鉴权 | 需要 ACC 会话 + auth token(前端原话 `Authentication token is required to send chat to agent service`) | 无 |

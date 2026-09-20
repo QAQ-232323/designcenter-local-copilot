@@ -7,6 +7,7 @@ web（Windows 浏览器和 Designcenter 内嵌页面）
 
 ## Product Purpose
 通过现有本地宿主接口，将模型配置、聊天、建模计划、人工复核与执行进度集中在同一页。
+顶部导航和快捷操作以可关闭的独立工作窗口呈现对应内容，并沿用同一份会话与计划状态。
 
 ## Stack
 现有 Node.js 零依赖宿主；原生 HTML、CSS、JavaScript 前端。
