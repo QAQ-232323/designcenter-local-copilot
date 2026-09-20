@@ -1,0 +1,25 @@
+!
+!  nx_copilot.tbr - put Copilot on the leftmost (docked) toolbar
+!  Added by the DC2026AI project. Not a Siemens original file.
+!
+!  Keyword order is fixed by NX: TITLE, then VERSION, then DOCK.
+!
+!  Buttons referenced here already exist:
+!    NX_SKILL_CONTROL_OPEN_COPILOT  - our working local-Copilot button
+!                                     (definition in definitions_nx_control.btn)
+!    UG_APP_COPILOT                 - built-in command, inert without the
+!                                     Designcenter X entitlement
+!
+!  Enable: Tools -> Customize -> Toolbars -> tick "Copilot"
+!          then drag it to the far left edge to dock it vertically.
+!
+TITLE  Copilot
+VERSION 160
+DOCK LEFT
+
+BUTTON NX_SKILL_CONTROL_OPEN_COPILOT
+
+BUTTON UG_APP_COPILOT
+
+BUTTON NX_SKILL_CONTROL_REVIEW_PLAN
+BUTTON NX_SKILL_CONTROL_START_BRIDGE

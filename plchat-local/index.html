@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Designcenter Copilot - 本地宿主</title>
+    <meta http-equiv="Content-Security-Policy" content="
+    default-src 'none';
+  script-src 'self' 'unsafe-inline' 'unsafe-eval'
+    https://acc.adhoc.us-east-1.preprod.teamcenterwebservices.com
+    https://acc.adhoc.us-east-1.int.teamcenterwebservices.com
+    https://*.sws.siemens.com
+    wss://*.sws.siemens.com;
+  style-src 'self' 'unsafe-inline' https://*.sws.siemens.com;
+  img-src 'self' data: https://*.sws.siemens.com;
+  font-src 'self' data: https://*.sws.siemens.com;
+  connect-src 'self' https://*.sws.siemens.com wss://*.sws.siemens.com;">
+  </head>
+<script src="PLChatAgentEventHandler.js"></script>
+<script src="hostInterop_async.js"></script>
+<script src="AppService.js"></script>
+<script src="NXService.js"></script>
+<script src="HostInteropService.js"></script>
+<script src="PLChatEventHandler.js"></script>
+<script src="PLChatFeedbackEventUtils.js"></script>
+<script src="plchat.js"></script>
+<script src="host-stub.js"></script>
+<script src="settings.js"></script>
+  <body style="margin:0px">
+    <div class="masterDetails">
+      <div class="tabcontentContainer">
+        <div id="plchat-element" class="des-xchat-default" style="height:100vh;"></div>
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,35 @@
+VERSION 120
+CREATE BUTTON_DEFINITIONS
+
+BUTTON NX_SKILL_CONTROL_REVIEW_PLAN
+LABEL Review Plan
+TOOLBAR_LABEL Review Plan
+MESSAGE Opens the human-paced review dialog: run agent-planned steps one at a time, watch each change, and undo any step.
+NO_REPEAT
+ACCELERATOR Ctrl+Alt+Shift+R
+ACTIONS nx_review_executor.py
+
+BUTTON NX_SKILL_CONTROL_START_BRIDGE
+LABEL Start NX Skill Live Bridge
+TOOLBAR_LABEL Start NX Skill Live Bridge
+MESSAGE Starts the local NX skill live bridge inside the current NX process.
+NO_REPEAT
+ACCELERATOR Ctrl+Alt+Shift+B
+ACTIONS nx_start_live_bridge.py
+
+BUTTON NX_SKILL_CONTROL_CREATE_TEST_PART
+LABEL Create NX Skill Smoke Part
+TOOLBAR_LABEL Create NX Skill Smoke Part
+MESSAGE Creates a visible smoke-test modeling part in the current NX window.
+NO_REPEAT
+ACCELERATOR Ctrl+Alt+Shift+N
+ACTIONS create_smoke_part.py
+
+BUTTON NX_SKILL_CONTROL_OPEN_COPILOT
+LABEL Copilot (Local)...
+TOOLBAR_LABEL Copilot
+MESSAGE Opens the local Copilot host page inside Designcenter (works without the Designcenter X entitlement).
+BITMAP ai_indicator
+NO_REPEAT
+ACCELERATOR Ctrl+Alt+Shift+C
+ACTIONS open_local_copilot.py

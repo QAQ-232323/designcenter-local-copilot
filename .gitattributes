@@ -1,0 +1,19 @@
+# 行尾规范化 —— 别让 Windows 的 autocrlf 把 shell 脚本换成 CRLF
+# (CRLF 的 .sh 在 bash 下会报 "\r: command not found")
+* text=auto
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.tbr   text eol=crlf
+*.men   text eol=crlf
+*.btn   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.cs    text eol=crlf
+
+*.png   binary
+*.dll   binary
+*.exe   binary

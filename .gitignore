@@ -1,0 +1,40 @@
+# ── 密钥 / 本地配置(绝不入库) ───────────────────────────
+config.json
+*.key
+.env
+.env.*
+
+# ── 从本机 NX 安装或西门子 CDN 取得的文件(版权归 Siemens,勿再分发) ──
+# 用 plchat-local/fetch-frontend.sh 与 fetch-assets.sh 在本机重新生成
+plchat-local/plchat_v2/
+plchat-local/cache/
+plchat-local/AppService.js
+plchat-local/HostInteropService.js
+plchat-local/NXService.js
+plchat-local/PLChat*.js
+plchat-local/plchat.js
+plchat-local/hostInterop_async.js
+plchat-local/PLChat.original.html
+
+# ── 运行期产物 ──────────────────────────────────────
+plchat-local/server.log
+*.log
+node_modules/
+__pycache__/
+*.pyc
+
+# ── 调试残留(截图 / 抓包存档 / 一次性探针输出) ────────────
+plchat-local/tools/*.png
+plchat-local/tools/ans*.json
+plchat-local/tools/*.json
+plchat-local/tools/*.txt
+graphflow-out/
+_dcmcp-analysis/
+*.tmp
+*.bak
+
+# ── 编辑器 / 系统 ───────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

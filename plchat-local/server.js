@@ -1,0 +1,1465 @@
+/* server.js — Designcenter Copilot 本地宿主
+ *
+ *  角色:
+ *   1) 静态托管官方内置 Copilot 页面(plchat_v2 本地镜像)
+ *   2) /api/ask              聊天页后端:多供应商大模型 + nx-skill function calling
+ *   3) /api/settings[...]    页面内设置面板的后端(多供应商切换/测试)
+ *   4) /api/tools, /api/tool 工具直调(调试)
+ *   5) /mock/v1/chat/...     伪 OpenAI 接口,无模型时自测工具闭环
+ *
+ * 零依赖(Node 内置模块)。
+ */
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const url = require("url");
+const { spawn } = require("child_process");
+
+const ROOT = __dirname;
+const PORT = Number(process.argv[2] || process.env.PORT || 8765);
+const CFG_PATH = path.join(ROOT, "config.json");
+
+/* ------------------------------------------------------------------ *
+ * 配置:多供应商
+ * ------------------------------------------------------------------ */
+const PRESETS = {
+  "mimo-tokenplan": { label: "小米 MiMo(Token Plan)", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", model: "mimo-v2.5", models: ["mimo-v2.5", "mimo-v2.5-pro"] },
+  "mimo":           { label: "小米 MiMo(标准 sk-)",  baseUrl: "https://api.xiaomimimo.com/v1",        model: "mimo-v2.5", models: ["mimo-v2.5", "mimo-v2.5-pro"] },
+  "deepseek":       { label: "DeepSeek",              baseUrl: "https://api.deepseek.com/v1",          model: "deepseek-chat", models: ["deepseek-chat", "deepseek-reasoner"] },
+  "openai":         { label: "OpenAI",                baseUrl: "https://api.openai.com/v1",            model: "gpt-4o-mini", models: ["gpt-4o-mini", "gpt-4o"] },
+  "ollama":         { label: "Ollama(本地)",          baseUrl: "http://127.0.0.1:11434/v1",            model: "qwen2.5:7b", models: ["qwen2.5:7b", "qwen2.5:14b"] },
+  "lmstudio":       { label: "LM Studio(本地)",       baseUrl: "http://127.0.0.1:1234/v1",             model: "local-model", models: [] },
+  "mock":           { label: "内置自测(mock)",        baseUrl: "http://127.0.0.1:8765/mock/v1",        model: "mock-model", models: ["mock-model"] },
+  "custom":         { label: "自定义(OpenAI 兼容)",   baseUrl: "",                                     model: "", models: [] }
+};
+
+const DEFAULT_SYS = "你是 Siemens Designcenter / NX 的 CAD 助手,用简体中文回答,给可直接照做的步骤。" +
+  "涉及本机 NX 环境或 NXOpen API 时,先用工具查证再回答,不要凭记忆猜 API 名。" +
+  "当用户要一份建模计划时,用 nx_route_intent + nx_modeling_plan 产出分阶段计划,不要只有一步。" +
+  "当用户明确表示要把它拿到 NX 里执行时,调用 nx_review_submit 提交计划:步骤名用 NN_Short_Action_Object 编号;" +
+  "CAE 求解、保存、导出、布尔、删除、批量改特征这类破坏性步骤一律 gate=manual,参考几何/草图/基本体可用 gate=auto。" +
+  "当计划需要 journal 步骤时,你必须自己写出完整的 NXOpen Python 脚本放进 script 字段:脚本必须包含 def main(): ... 以及 if __name__ == '__main__': main() 的入口(执行器用 runpy 以 __main__ 运行它);不要用 f-string(内嵌解释器可能是 Python 2.7),不要依赖第三方库,只 import NXOpen / NXOpen.xxx;操作当前工作零件(session.Parts.Work),不要调用 Save/Export(那是单独的 manual 步骤);不要自己调用 SetUndoMark / UndoToMark(执行器已为每步建撤销标记);每个提交的对象按 NN_Short_Action_Object 命名,让部件导航器读起来是有序历史;写之前先用 nx_docs_search / nx_docs_member 核对 API 名称与签名,不要凭记忆写;params.path 用形如 02_FLANGE_Bolt_Holes.py 的文件名并与步骤名对应;脚本要短小、单步可诊断。" +
+  "提交后告诉用户去 Designcenter 里点 NX Skill → Review Plan 逐步执行。绝对不要声称你已经执行或已经改动模型。";
+
+function loadRaw() {
+  try { return JSON.parse(fs.readFileSync(CFG_PATH, "utf8")); } catch (e) { return {}; }
+}
+
+/** 兼容旧版扁平配置 -> 新版多供应商结构 */
+function loadConfig() {
+  const raw = loadRaw();
+  const cfg = {
+    activeProvider: raw.activeProvider || "mock",
+    providers: Object.assign({}, raw.providers),
+    systemPrompt: raw.systemPrompt || DEFAULT_SYS,
+    nxSkillRoot: raw.nxSkillRoot || "",
+    nxRoot: raw.nxRoot || "",
+    nxWorkspace: raw.nxWorkspace || "",
+    python: raw.python || "python",
+    toolTimeoutMs: raw.toolTimeoutMs || 60000,
+    maxToolRounds: raw.maxToolRounds || 8,
+    colorTheme: raw.colorTheme || "light",
+    locale: raw.locale || "en_US",
+    version: raw.version || "2606.1700"
+  };
+  // 旧版:顶层 provider/baseUrl/apiKey/model
+  if (!Object.keys(cfg.providers).length && (raw.baseUrl || raw.provider)) {
+    cfg.providers[raw.provider || "custom"] = {
+      baseUrl: raw.baseUrl || "", apiKey: raw.apiKey || "", model: raw.model || ""
+    };
+    cfg.activeProvider = raw.provider || "custom";
+  }
+  // 保证每个 preset 都存在(便于面板里切换)
+  for (const [id, p] of Object.entries(PRESETS)) {
+    if (!cfg.providers[id]) cfg.providers[id] = { baseUrl: p.baseUrl, apiKey: "", model: p.model };
+  }
+  return cfg;
+}
+
+function saveConfig(cfg) {
+  fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2));
+}
+
+/** 取当前生效的供应商参数 */
+function active(cfg) {
+  const id = cfg.activeProvider;
+  const p = cfg.providers[id] || {};
+  const preset = PRESETS[id] || {};
+  return {
+    id,
+    label: preset.label || id,
+    baseUrl: (p.baseUrl || preset.baseUrl || "").replace(/\/+$/, ""),
+    apiKey: p.apiKey || "",
+    model: p.model || preset.model || ""
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 自动执行:把整份计划交给一次 headless NX 跑完(不需要人一步步点)
+ * 说明:这走的是 run_journal 批处理,不是 Review 对话框 —— 因为"无人点击"
+ * 就意味着不能依赖 NX 主线程 + 人工节拍。代价是看不到过程。
+ * ------------------------------------------------------------------ */
+function buildDriver(plan, cfg) {
+  const ws = cfg.nxWorkspace || "";
+  const scripts = path.join(ws, "review", "scripts");
+  const parts = path.join(ws, "parts");
+  const report = path.join(ws, "review", "run_report.json");
+  const part = path.join(parts, "plan_" + (plan.planId || "run") + ".prt");
+  const steps = (plan.steps || [])
+    .filter(s => s.operation === "journal")
+    .map(s => ({ id: s.id, name: s.name, file: path.basename(String((s.params || {}).path || "")) }));
+  const src = [
+    "# -*- coding: utf-8 -*-",
+    "# 由本地宿主自动生成:按顺序执行复核计划里的 journal 步骤",
+    "import json",
+    "import os",
+    "import runpy",
+    "import traceback",
+    "",
+    "import NXOpen",
+    "",
+    "PART = r" + JSON.stringify(part),
+    "SCRIPTS = r" + JSON.stringify(scripts),
+    "REPORT = r" + JSON.stringify(report),
+    "STEPS = " + JSON.stringify(steps, null, 1),
+    "",
+    "",
+    "def main():",
+    "    session = NXOpen.Session.GetSession()",
+    "    d = os.path.dirname(PART)",
+    "    if d and not os.path.isdir(d):",
+    "        os.makedirs(d)",
+    "    part = session.Parts.NewDisplay(PART, NXOpen.Part.Units.Millimeters)",
+    "    session.Parts.SetWork(part)",
+    "    session.Parts.SetDisplay(part, False, False)",
+    "    out = []",
+    "    for st in STEPS:",
+    '        rec = {"id": st["id"], "name": st["name"], "script": st["file"], "status": "pending"}',
+    "        try:",
+    '            session.SetUndoMark(NXOpen.Session.MarkVisibility.Visible, st["name"])',
+    '            runpy.run_path(os.path.join(SCRIPTS, st["file"]), run_name="__main__")',
+    '            rec["status"] = "done"',
+    "        except Exception as exc:",
+    '            rec["status"] = "failed"',
+    '            rec["message"] = str(exc)',
+    '            rec["traceback"] = traceback.format_exc()[-1200:]',
+    "        out.append(rec)",
+    "    saved = False",
+    "    try:",
+    "        part.Save(NXOpen.BasePart.SaveComponents.TrueValue, NXOpen.BasePart.CloseAfterSave.FalseValue)",
+    "        saved = True",
+    "    except Exception as exc:",
+    '        out.append({"id": "save", "name": "save", "status": "failed", "message": str(exc)})',
+    '    with open(REPORT, "w") as fh:',
+    '        json.dump({"part": PART, "saved": saved, "steps": out}, fh, ensure_ascii=False, indent=1)',
+    "",
+    "",
+    'if __name__ == "__main__":',
+    "    main()",
+    ""
+  ].join("\n");
+  return { src, part, report, scriptCount: steps.length };
+}
+
+/** 在当前打开的 NX 会话里执行计划(走 live 桥,作用于当前工作零件) */
+async function runPlanLive(cfg) {
+  const ws = cfg.nxWorkspace || "";
+  const planPath = path.join(ws, "review", "plan.json");
+  if (!fs.existsSync(planPath)) return { ok: false, error: "队列里没有计划" };
+  let plan; try { plan = JSON.parse(fs.readFileSync(planPath, "utf8")); } catch (e) { return { ok: false, error: "plan.json 解析失败" }; }
+
+  const steps = (plan.steps || []).filter(s => s.operation === "journal");
+  if (!steps.length) return { ok: false, error: "这份计划没有可执行的 journal 步骤" };
+
+  progressStart("run", "在当前 NX 会话执行 " + (plan.planId || ""));
+  progressStage("ping", "检查 live 桥…");
+  const ping = await runNxSkill(cfg, ["live", "ping"], 30000);
+  if (!(ping.envelope && ping.envelope.ok)) {
+    progressEnd("failed");
+    return { ok: false, error: "live 桥没在运行。请在 Designcenter 里点:菜单 NX Skill → Start NX Skill Live Bridge,然后重试。" };
+  }
+
+  const out = [];
+  for (const s of steps) {
+    const base = path.basename(String((s.params || {}).path || ""));
+    const f = path.join(ws, "review", "scripts", base);
+    if (!base || !fs.existsSync(f)) { out.push({ id: s.id, name: s.name, status: "failed", message: "脚本缺失:" + base }); continue; }
+    const src = fs.readFileSync(f, "utf8");
+    progressStage("running", "在当前会话执行 " + s.name + " …");
+    const r = await runNxSkill(cfg, ["live", "python", "--stage", s.name], cfg.toolTimeoutMs, src);
+    const ok = !!(r.envelope && r.envelope.ok);
+    out.push({ id: s.id, name: s.name, script: base, status: ok ? "done" : "failed", ms: r.ms,
+               message: ok ? "" : ((r.envelope && r.envelope.error && (r.envelope.error.message || r.envelope.error.error)) || r.stderr || "") });
+    console.log("[run-live] " + s.name + " -> " + (ok ? "done" : "failed") + " (" + r.ms + "ms)");
+    if (!ok) break;
+  }
+  progressEnd(out.some(x => x.status === "failed") ? "failed" : "done");
+  return { ok: out.every(x => x.status === "done"), mode: "live", steps: out,
+           failed: out.filter(x => x.status === "failed").length,
+           note: "改动作用在你当前打开并设为工作零件的文件上;脚本不会自动保存,需要保存请手动 Ctrl+S。" };
+}
+
+async function runPlanBatch(cfg) {
+  const ws = cfg.nxWorkspace || "";
+  const planPath = path.join(ws, "review", "plan.json");
+  if (!fs.existsSync(planPath)) return { ok: false, error: "队列里没有计划" };
+  let plan; try { plan = JSON.parse(fs.readFileSync(planPath, "utf8")); } catch (e) { return { ok: false, error: "plan.json 解析失败" }; }
+
+  const d = buildDriver(plan, cfg);
+  if (!d.scriptCount) return { ok: false, error: "这份计划没有可自动执行的 journal 步骤" };
+
+  const missing = [];
+  for (const st of plan.steps.filter(x => x.operation === "journal")) {
+    const base = path.basename(String((st.params || {}).path || ""));
+    if (!base || !fs.existsSync(path.join(ws, "review", "scripts", base))) missing.push(base || st.name);
+  }
+  if (missing.length) return { ok: false, error: "脚本缺失(可能被清理策略删掉了):" + missing.join(", ") };
+
+  fs.writeFileSync(path.join(ws, "review", "batch_driver.py"), d.src, "utf8");
+  try { fs.unlinkSync(d.report); } catch (e) { }
+
+  progressStart("run", "自动执行计划 " + (plan.planId || ""));
+  progressStage("running", "headless NX 正在执行 " + d.scriptCount + " 个步骤…");
+  const r = await runNxSkill(cfg, ["journal", "run", "review/batch_driver.py", "--timeout", "600"], 660000);
+  progressEnd("done");
+
+  let rep = null;
+  try { rep = JSON.parse(fs.readFileSync(d.report, "utf8")); } catch (e) { }
+  const env = r.envelope || {};
+  if (!rep) {
+    return { ok: false, error: "NX 没有产出执行报告(run_report.json)。" + (r.stderr || env.error || "").slice(0, 400), raw: env };
+  }
+  const failed = (rep.steps || []).filter(s => s.status === "failed");
+  return {
+    ok: failed.length === 0, part: rep.part, saved: rep.saved,
+    steps: rep.steps, failed: failed.length, ms: r.ms,
+    nxSeconds: (env.result || {}).durationSeconds
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 清理:Copilot 集成产生的临时数据
+ * 1) scratch —— %TEMP%\nxreview-* 等运行残留(纯垃圾,任何时候都该清)
+ * 2) queue   —— 复核队列(plan.json / run.json / scripts / screenshots)
+ * 策略由 config.cleanupOnNxExit 决定: "all"(默认) | "scratch" | "off"
+ * ------------------------------------------------------------------ */
+let LAST_CLEANUP = null;
+let JOB_SEQ = 0;
+const JOBS = new Map();   // 生成计划的后台任务:POST 起任务,GET 轮询,避免长请求被掐断
+
+function dirSize(p) {
+  let total = 0;
+  try {
+    const st = fs.statSync(p);
+    if (st.isFile()) return st.size;
+    for (const n of fs.readdirSync(p)) total += dirSize(path.join(p, n));
+  } catch (e) { }
+  return total;
+}
+function rmrf(p) { try { fs.rmSync(p, { recursive: true, force: true }); return true; } catch (e) { return false; } }
+
+function cleanScratch() {
+  const rep = { tempDirs: 0, bytes: 0 };
+  const tmpRoot = require("os").tmpdir();
+  try {
+    for (const n of fs.readdirSync(tmpRoot)) {
+      if (n.indexOf("nxreview-") !== 0) continue;
+      const p = path.join(tmpRoot, n);
+      rep.bytes += dirSize(p);
+      if (rmrf(p)) rep.tempDirs++;
+    }
+  } catch (e) { }
+  return rep;
+}
+
+function cleanQueue(cfg) {
+  const ws = cfg.nxWorkspace || "";
+  const dir = ws ? path.join(ws, "review") : "";
+  const rep = { dir, files: 0, bytes: 0 };
+  if (!dir || !fs.existsSync(dir)) return rep;
+  for (const sub of ["scripts", "screenshots"]) {
+    const d = path.join(dir, sub);
+    if (!fs.existsSync(d)) continue;
+    for (const f of fs.readdirSync(d)) {
+      const p = path.join(d, f);
+      rep.bytes += dirSize(p);
+      if (rmrf(p)) rep.files++;
+    }
+  }
+  for (const f of ["plan.json", "run.json"]) {
+    const p = path.join(dir, f);
+    if (!fs.existsSync(p)) continue;
+    rep.bytes += dirSize(p);
+    if (rmrf(p)) rep.files++;
+  }
+  return rep;
+}
+
+/** smart 策略:队列里还有没跑的步骤就留着,跑完了才清 */
+function queueLooksFinished(cfg) {
+  const ws = cfg.nxWorkspace || "";
+  const planPath = ws ? path.join(ws, "review", "plan.json") : "";
+  if (!planPath || !fs.existsSync(planPath)) return true;      // 本来就没计划
+  let plan; try { plan = JSON.parse(fs.readFileSync(planPath, "utf8")); } catch (e) { return true; }
+  const ids = (plan.steps || []).map(s => s.id);
+  const logPath = path.join(path.dirname(planPath), "run.json");
+  let log = null; try { log = JSON.parse(fs.readFileSync(logPath, "utf8")); } catch (e) { }
+  const done = {};
+  ((log && log.records) || []).forEach(r => { done[r.id] = r.status; });
+  const pending = ids.filter(id => !done[id] || done[id] === "pending" || done[id] === "running");
+  return pending.length === 0;
+}
+
+function runCleanup(scope, reason) {
+  const cfg = loadConfig();
+  if (scope === "smart") {
+    const finished = queueLooksFinished(cfg);
+    const eff = finished ? "all" : "scratch";
+    console.log("[cleanup] smart 策略:队列" + (finished ? "已跑完" : "还有未执行步骤,保留计划与脚本") + " → 实际执行 " + eff);
+    scope = eff;
+  }
+  const out = { at: new Date().toLocaleString("zh-CN"), scope, reason, scratch: null, queue: null };
+  if (scope === "scratch" || scope === "all") out.scratch = cleanScratch();
+  if (scope === "queue" || scope === "all") out.queue = cleanQueue(cfg);
+  LAST_CLEANUP = out;
+  console.log("[cleanup] " + reason + " scope=" + scope +
+    (out.scratch ? " | 临时目录 " + out.scratch.tempDirs + " 个/" + Math.round(out.scratch.bytes / 1024) + "KB" : "") +
+    (out.queue ? " | 队列文件 " + out.queue.files + " 个/" + Math.round(out.queue.bytes / 1024) + "KB" : ""));
+  return out;
+}
+
+/** Designcenter 是否在运行 */
+function nxRunning() {
+  try {
+    const { spawnSync } = require("child_process");
+    const o = spawnSync("tasklist", ["/FI", "IMAGENAME eq ugraf.exe"], { encoding: "utf8", windowsHide: true }).stdout || "";
+    return /ugraf\.exe/i.test(o);
+  } catch (e) { return false; }
+}
+
+/** 盯着 Designcenter 退出,退出后按策略清理 */
+let NX_WAS_RUNNING = null;
+function startNxExitWatcher() {
+  setInterval(() => {
+    const now = nxRunning();
+    if (NX_WAS_RUNNING === true && now === false) {
+      const scope = loadConfig().cleanupOnNxExit || "all";
+      if (scope === "off") console.log("[cleanup] Designcenter 已退出,策略为 off,跳过清理");
+      else runCleanup(scope, "Designcenter 已退出");
+    }
+    NX_WAS_RUNNING = now;
+  }, 8000);
+}
+
+/* ------------------------------------------------------------------ *
+ * 进度与思维链
+ * 一次提问/生成要几十秒到几分钟,页面上不能只显示"Generating..."。
+ * 这里把阶段、工具调用、以及模型的 reasoning_content(思维链)实时暴露出去,
+ * 页面轮询 /api/progress 显示,免得用户以为卡死。
+ * ------------------------------------------------------------------ */
+const PROGRESS = {
+  active: false, id: 0, kind: "", question: "", stage: "", detail: "",
+  started: 0, updated: 0, attempts: 0, tools: [], reasoning: []
+};
+
+function progressStart(kind, question) {
+  PROGRESS.active = true;
+  PROGRESS.id++;
+  PROGRESS.kind = kind;
+  PROGRESS.question = String(question || "").slice(0, 200);
+  PROGRESS.stage = "thinking";
+  PROGRESS.detail = "正在思考…";
+  PROGRESS.started = Date.now();
+  PROGRESS.updated = Date.now();
+  PROGRESS.attempts = 0;
+  PROGRESS.tools = [];
+  PROGRESS.reasoning = [];
+  console.log("[progress] start " + kind + ": " + PROGRESS.question.slice(0, 60));
+}
+function progressStage(stage, detail) {
+  PROGRESS.stage = stage;
+  PROGRESS.detail = detail || "";
+  PROGRESS.updated = Date.now();
+}
+/** 追加思维链增量(流式),只保留尾部若干字符 */
+function progressReasoningDelta(text) {
+  if (!text) return;
+  PROGRESS.reasoning.push(text);
+  let all = PROGRESS.reasoning.join("");
+  if (all.length > 8000) PROGRESS.reasoning = ["…" + all.slice(-7800)];
+  PROGRESS.updated = Date.now();
+}
+function progressReasoning(text) { if (text) progressReasoningDelta(String(text)); }
+function progressTool(name, args, res) {
+  PROGRESS.tools.push({
+    name, args: Object.keys(args || {}).length ? JSON.stringify(args).slice(0, 120) : "",
+    ok: !!res.ok, ms: res.ms || 0
+  });
+  PROGRESS.updated = Date.now();
+}
+function progressEnd(stage) {
+  PROGRESS.active = false;
+  PROGRESS.stage = stage || "done";
+  PROGRESS.updated = Date.now();
+}
+
+/** 读用户级环境变量(注册表),代表"新启动的进程会看到的值" */
+function machineEnv(name) {
+  try {
+    const out = require("child_process").execFileSync("reg", ["query", "HKCU\\Environment", "/v", name], { windowsHide: true }).toString("utf8");
+    const m = out.match(/REG_SZ\s+(.+)/);
+    return m ? m[1].trim() : "";
+  } catch (e) { return ""; }
+}
+
+const MIME = {
+  ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml", ".png": "image/png"
+};
+const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const toHtml = (t) => esc(t).replace(/\r?\n/g, "<br>");
+const mask = (k) => (k ? k.slice(0, 5) + "…" + k.slice(-4) : "");
+
+/* ------------------------------------------------------------------ *
+ * nx-skill 工具桥
+ * ------------------------------------------------------------------ */
+function nxEnv(cfg) {
+  const e = Object.assign({}, process.env);
+  e.PYTHONPATH = cfg.nxSkillRoot ? path.join(cfg.nxSkillRoot, "src") : "src";
+  e.PYTHONIOENCODING = "utf-8";
+  e.PYTHONUTF8 = "1";
+  e.NX_SKILL_SKIP_GLOBAL_SEARCH = "true";
+  if (cfg.nxRoot) e.NX_SKILL_NX_ROOT = cfg.nxRoot;              // 本机遗留 NX2512_ROOT 指向不存在的版本
+  if (cfg.nxWorkspace) {
+    e.NX_SKILL_WORKSPACE = cfg.nxWorkspace;      // 与 NXMCP 隔离
+    // live 桥的 C# 客户端用这个变量校验"脚本必须在工程目录下";不设会回退到
+    // 遗留的 NX2512_PROJECT_ROOT(=NXMCP),把我们的脚本拒掉
+    e.NX_SKILL_PROJECT_ROOT = cfg.nxWorkspace;
+  }
+  return e;
+}
+
+function runNxSkill(cfg, args, timeoutMs, input) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    let p;
+    try {
+      p = spawn(cfg.python || "python", ["-m", "nx_skill", ...args], {
+        cwd: cfg.nxSkillRoot || ROOT, env: nxEnv(cfg), windowsHide: true
+      });
+    } catch (e) { resolve({ code: -1, ms: 0, envelope: null, raw: "", stderr: String(e) }); return; }
+    let out = "", err = "";
+    const timer = setTimeout(() => { try { p.kill(); } catch (e) { } }, timeoutMs || 60000);
+    if (input !== undefined && input !== null) {
+      try { p.stdin.write(typeof input === "string" ? input : JSON.stringify(input)); p.stdin.end(); } catch (e) { }
+    }
+    p.stdout.on("data", (d) => (out += d.toString("utf8")));
+    p.stderr.on("data", (d) => (err += d.toString("utf8")));
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      let env = null; try { env = JSON.parse(out); } catch (e) { }
+      resolve({ code, ms: Date.now() - t0, envelope: env, raw: out.slice(0, 4000), stderr: err.slice(0, 800) });
+    });
+    p.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, ms: 0, envelope: null, raw: "", stderr: String(e) }); });
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ * NXOpen API 名门禁
+ * 模型很容易写出"看着像但不存在"的 NXOpen 调用(例如 NXOpen.Sketches.Xxx、
+ * NXOpen.Sketch.ViewReorient.TrueValue)。这类脚本会在用户点执行时才炸。
+ * 这里用本机安装自带的 NXOpen.xml 建成的离线索引,在提交前就拦下来。
+ * ------------------------------------------------------------------ */
+let NXOPEN_INDEX = null;
+let NXOPEN_NS = null;
+function nxopenIndex() {
+  if (NXOPEN_INDEX) return NXOPEN_INDEX;
+  const f = path.join(ROOT, "cache", "nxopen-names.txt");
+  try {
+    // 注意: Python 在 Windows 文本模式下写出的行尾是 \r\n,必须去掉 \r
+    const names = fs.readFileSync(f, "utf8").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    NXOPEN_INDEX = new Set(names);
+    // 命名空间集合 = 每个名字的所有前缀(用于放行 import NXOpen.Features 这类写法)
+    NXOPEN_NS = new Set();
+    for (const n of names) {
+      const parts = n.split(".");
+      for (let i = 2; i < parts.length; i++) NXOPEN_NS.add(parts.slice(0, i).join("."));
+    }
+  } catch (e) { NXOPEN_INDEX = new Set(); NXOPEN_NS = new Set(); }
+  return NXOPEN_INDEX;
+}
+
+/** 去掉注释与字符串字面量,避免注释里提到的 API 造成误报 */
+function stripNonCode(src) {
+  return String(src)
+    .replace(/"""[-\s\S]*?"""/g, '""')
+    .replace(/'''[-\s\S]*?'''/g, "''")
+    .replace(/#[^\n]*/g, "")
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''");
+}
+
+let NXOPEN_BY_LEAF = null;
+/** 按"最后一段名字"反查候选,给出正确拼写建议 */
+function suggestNames(tok, idx) {
+  if (!NXOPEN_BY_LEAF) {
+    NXOPEN_BY_LEAF = new Map();
+    for (const n of idx) {
+      const leaf = n.split(".").pop();
+      let arr = NXOPEN_BY_LEAF.get(leaf);
+      if (!arr) { arr = []; NXOPEN_BY_LEAF.set(leaf, arr); }
+      if (arr.length < 8) arr.push(n);
+    }
+  }
+  const parts = tok.split(".");
+  const leaf = parts[parts.length - 1];
+  // ① 最优:找到真实存在的父类型,列出它下面的真实成员(带叶名相似度优先)
+  for (let i = parts.length - 1; i >= 2; i--) {
+    const parent = parts.slice(0, i).join(".");
+    if (!idx.has(parent)) continue;
+    const pref = parent + ".";
+    const key = leaf.slice(0, 3).toLowerCase();
+    const same = [], other = [];
+    for (const n of idx) {
+      if (!n.startsWith(pref) || n === parent) continue;
+      (n.split(".").pop().toLowerCase().indexOf(key) === 0 ? same : other).push(n);
+      if (same.length >= 6) break;
+    }
+    return same.concat(other).slice(0, 5);
+  }
+  // ② 回退:按叶名反查
+  const cands = NXOPEN_BY_LEAF.get(leaf);
+  return cands ? cands.slice(0, 3) : [];
+}
+
+/** 返回脚本里不存在的 NXOpen 名字 */
+function checkNxOpenNames(script) {
+  const idx = nxopenIndex();
+  if (!idx.size) return { ok: true, unknown: [], note: "索引缺失,已跳过 API 名检查" };
+  const code = stripNonCode(script);
+  const unknown = [];
+  const seen = new Set();
+  const re = /NXOpen(?:\.[A-Za-z_][A-Za-z0-9_]*)+/g;
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    const tok = m[0];
+    if (seen.has(tok)) continue;
+    seen.add(tok);
+    // 严格:必须是真实存在的 API 名,或是一个命名空间(供 import 用)。
+    // 不做"前缀宽松",否则 NXOpen.Sketch.Null 这种杜撰成员会被放过。
+    if (idx.has(tok)) continue;
+    if (NXOPEN_NS && NXOPEN_NS.has(tok)) continue;
+    unknown.push({ token: tok, suggest: suggestNames(tok, idx) });
+  }
+  return { ok: unknown.length === 0, unknown };
+}
+
+/** 用宿主 Python 对 journal 脚本做语法检查(只编译,不执行) */
+function checkPythonSyntax(file) {
+  const { spawnSync } = require("child_process");
+  const r = spawnSync("python", ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", file],
+    { encoding: "utf8", windowsHide: true });
+  if (r.status === 0) return { ok: true };
+  const msg = ((r.stderr || "") + (r.stdout || "")).trim();
+  return { ok: false, error: msg.split("\n").slice(-6).join("\n").slice(0, 1200) };
+}
+
+const TOOLS = {
+  nx_status: {
+    desc: "报告本机 NX / Designcenter 环境:实际安装根目录、版本、能力(API 文档/日志/python 模块)、工作区。回答任何与本机 NX 环境有关的问题前先调这个。",
+    params: { type: "object", properties: {}, required: [] },
+    args: () => ["doctor"],
+    compact: (e) => {
+      const r = (e && e.result) || {}, s = r.settings || {};
+      return {
+        detectedInstallations: (r.installations || []).map(i => ({ root: i.root, release: i.release, nxbin: i.nxbin, apiXmlDocCount: i.apiXmlDocCount, capabilities: i.capabilities })),
+        workspace: s.workspace, livePort: s.livePort,
+        runningNxGuiProcesses: r.nxGuiProcesses || [], problems: r.problems || [],
+        note: "detectedInstallations 才是本机真实存在的 NX 安装"
+      };
+    }
+  },
+  nx_docs_search: {
+    desc: "在 NX 安装自带的离线 API 文档里按关键字搜索类型/成员(精确对应本机版本,离线)。写 NXOpen 代码前用它核对 API 是否存在。",
+    params: { type: "object", properties: { query: { type: "string", description: "关键字,如 ExtrudeBuilder" }, kinds: { type: "string", description: "可选:type / method / property" } }, required: ["query"] },
+    args: (a) => ["docs", "search", String(a.query || ""), ...(a.kinds ? ["--kinds", String(a.kinds)] : []), "--summary"],
+    compact: (e) => ({ members: (((e || {}).result || {}).members || []).slice(0, 8).map(m => ({ name: m.name, kind: m.kind, summary: m.summary, createdIn: m.createdIn })) })
+  },
+  nx_docs_member: {
+    desc: "查一个具体 NXOpen 成员(方法/属性)的签名、参数、摘要和引入版本。",
+    params: { type: "object", properties: { name: { type: "string", description: "完整名,如 NXOpen.Session.UndoToMark" } }, required: ["name"] },
+    args: (a) => ["docs", "member", String(a.name || "")],
+    compact: (e) => ((e || {}).result || {})
+  },
+  nx_docs_type: {
+    desc: "查一个 NXOpen 类型的成员列表(方法/属性)与摘要。",
+    params: { type: "object", properties: { name: { type: "string", description: "完整类型名,如 NXOpen.Features.ExtrudeBuilder" } }, required: ["name"] },
+    args: (a) => ["docs", "type", String(a.name || "")],
+    compact: (e) => { const r = (e || {}).result || {}; return { type: r.type, memberCount: r.memberCount, members: (r.members || []).slice(0, 12).map(m => ({ name: m.name, kind: m.kind, summary: m.summary, createdIn: m.createdIn })) }; }
+  },
+  nx_route_intent: {
+    desc: "把用户的自然语言请求路由到合适的 NX 应用(建模/CAE/制图等),给出推荐模块与做法指引。收到建模类需求时先调它。",
+    params: { type: "object", properties: { text: { type: "string", description: "用户原话" } }, required: ["text"] },
+    args: (a) => ["route", String(a.text || "")],
+    compact: (e) => ((e || {}).result || {})
+  },
+  nx_modeling_plan: {
+    desc: "生成符合 NX 建模规范的建模计划骨架(分阶段、命名约定、可诊断的步骤切分)。",
+    params: { type: "object", properties: { text: { type: "string", description: "要建的东西" }, partName: { type: "string", description: "零件名" } }, required: ["text"] },
+    args: (a) => ["plan", String(a.text || ""), ...(a.partName ? ["--part-name", String(a.partName)] : [])],
+    compact: (e) => ((e || {}).result || {})
+  },
+  nx_visual_spec: {
+    desc: "三视图/图片建模的规则与约束(识图建模时用)。",
+    params: { type: "object", properties: {}, required: [] },
+    args: () => ["visual-spec"],
+    compact: (e) => ((e || {}).result || {})
+  }
+};
+
+// ---- Review(人工节拍执行):计划落到 workspace/review/,由人在 NX 菜单里逐步执行 ----
+TOOLS.nx_review_submit = {
+  desc: "把一份建模计划提交到 NX 的人工复核队列(workspace/review/plan.json)。提交后【不会自动执行】——" +
+    "必须由人在 NX 里打开 NX Skill → Review Plan 逐步点击执行。破坏性步骤(CAE 求解、保存、导出、布尔、删除)一律用 gate=manual。",
+  params: {
+    type: "object",
+    properties: {
+      prompt: { type: "string", description: "用户的原始需求" },
+      partPath: { type: "string", description: "可选:目标零件路径(留空则在当前窗口建模)" },
+      steps: {
+        type: "array",
+        description: "有序步骤。name 必须形如 NN_Short_Action_Object(编号让人看得出历史顺序)",
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "如 01_Base_Block、02_Mounting_Holes" },
+            operation: { type: "string", enum: ["create_block", "journal", "status", "screenshot", "noop"] },
+            gate: { type: "string", enum: ["auto", "manual"], description: "auto=可连续执行;manual=必须人点(默认)" },
+            params: { type: "object", description: "create_block: {length,width,height,feature_name};journal: {path:'02_holes.py'}" },
+            script: { type: "string", description: "operation=journal 时必填:NXOpen Python 脚本源码。会被复制到 review/scripts/<params.path> 供用户执行前审阅。" },
+            note: { type: "string", description: "给人看的说明" }
+          },
+          required: ["name", "operation", "gate"]
+        }
+      }
+    },
+    required: ["steps"]
+  },
+  prepare: async (a, cfg) => {
+    const os = require("os");
+    const steps = (a.steps || []).map((s, i) => ({
+      id: s.id || String(i + 1).padStart(2, "0"),
+      name: s.name, operation: s.operation,
+      gate: s.gate || "manual",
+      params: Object.assign({}, s.params || {}),
+      note: s.note || ""
+    }));
+    const args = ["review", "submit"];
+    let tmp = null;
+    for (let i = 0; i < steps.length; i++) {
+      const s = a.steps[i] || {};
+      if (s.operation !== "journal" || !s.script) continue;
+      if (!tmp) tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nxreview-"));
+      // 文件名必须与 params.path 一致:nx-skill 以源文件名为键复制进 review/scripts/
+      const base = path.basename(String(steps[i].params.path || (steps[i].name + ".py")));
+      steps[i].params.path = base;
+      const f = path.join(tmp, base);
+      fs.writeFileSync(f, String(s.script), "utf8");
+
+      // 语法门禁:脚本要在 NX 里跑,写错语法只会在用户点击那一步才炸。
+      // 这里先用宿主 Python 做一次 py_compile,把错误当场退回给模型重写。
+      const py = await checkPythonSyntax(f);
+      if (!py.ok) {
+        throw new Error("步骤 " + steps[i].name + " 的脚本 " + base + " 语法有误,请修正后重新提交:\n" + py.error);
+      }
+      const api = checkNxOpenNames(String(s.script));
+      if (!api.ok) {
+        throw new Error("步骤 " + steps[i].name + " 的脚本 " + base + " 里用了不存在的 NXOpen API:" +
+          api.unknown.map(u => "\n  - " + u.token + (u.suggest.length ? "   可能是: " + u.suggest.join(" / ") : "")).join("") +
+          "\n请直接用上面给出的名字改掉,然后重新提交;不要再反复搜索 API。");
+      }
+      args.push("--script", f);
+    }
+    return { args, input: JSON.stringify({ prompt: a.prompt || "", partPath: a.partPath || "", steps }), tmp };
+  },
+  compact: (e) => {
+    const r = (e || {}).result || {};
+    return {
+      planPath: r.planPath, planId: r.planId, stepCount: r.stepCount,
+      steps: (r.steps || []).map(s => ({ name: s.name, operation: s.operation, gate: s.gate })),
+      scriptsWritten: r.scriptsWritten,
+      nextAction: "计划已写入队列,不会自动执行。请立刻停止调用工具,直接告诉用户:" +
+        "在 Designcenter 里打开 NX Skill → Review Plan,逐步点击执行;每步可撤销、会自动截图留痕。"
+    };
+  }
+};
+TOOLS.nx_review_status = {
+  desc: "查看人工复核队列的进度:计划是否存在、每一步是完成/待执行/已撤销。",
+  params: { type: "object", properties: {}, required: [] },
+  args: () => ["review", "status"],
+  compact: (e) => ((e || {}).result || {})
+};
+TOOLS.nx_review_clear = {
+  desc: "清空复核队列(删除 plan.json 与 run.json)。只在用户明确要求时调用。",
+  params: { type: "object", properties: {}, required: [] },
+  args: () => ["review", "clear"],
+  compact: (e) => ((e || {}).result || {})
+};
+
+const toolSchemas = () => Object.entries(TOOLS).map(([name, t]) => ({
+  type: "function", function: { name, description: t.desc, parameters: t.params }
+}));
+
+/** 每个工具在一次提问里的调用额度。用完就从工具表里摘掉——
+ *  实测光靠提示词劝不住模型反复搜索,摘掉工具才是结构性的解法。 */
+const TOOL_LIMITS = {
+  nx_status: 1, nx_route_intent: 1, nx_modeling_plan: 1, nx_visual_spec: 1,
+  nx_docs_search: 2, nx_docs_member: 2, nx_docs_type: 2,   // 刻意收紧:API 名由提交时的门禁负责纠错
+  nx_review_submit: 4, nx_review_status: 2, nx_review_clear: 1
+};
+
+function availableSchemas(cfg, used) {
+  const limits = Object.assign({}, TOOL_LIMITS, cfg.toolLimits || {});
+  return toolSchemas().filter(s => {
+    const n = s.function.name;
+    const lim = limits[n] === undefined ? 99 : limits[n];
+    return (used[n] || 0) < lim;
+  });
+}
+
+async function execTool(cfg, name, args) {
+  const t = TOOLS[name];
+  if (!t) return { ok: false, error: "unknown tool: " + name, ms: 0 };
+
+  let argv, stdin, tmp;
+  let r;
+  try {
+    if (t.prepare) {
+      const p = await t.prepare(args || {}, cfg);
+      argv = p.args; stdin = p.input; tmp = p.tmp;
+    } else {
+      argv = t.args(args || {});
+      stdin = t.input ? t.input(args || {}) : undefined;
+    }
+    r = await runNxSkill(cfg, argv, cfg.toolTimeoutMs, stdin);
+  } catch (e) {
+    return { ok: false, error: "工具参数准备失败: " + (e.message || e), ms: 0 };
+  } finally {
+    // 必须在 finally 里清:校验失败时 prepare 会抛错,原来那样就把临时目录留在 %TEMP% 了
+    if (tmp) { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { } }
+  }
+  const ok = !!(r.envelope && r.envelope.ok);
+  return { ok, ms: r.ms, data: ok ? t.compact(r.envelope) : null, error: ok ? null : (r.stderr || r.raw || "tool failed") };
+}
+
+/* ------------------------------------------------------------------ *
+ * 大模型调用
+ * ------------------------------------------------------------------ */
+async function chatOnce(cfg, messages, opts) {
+  const a = active(cfg);
+  if (!a.baseUrl) throw new Error("未配置 baseUrl(请在设置里选择供应商或填写自定义地址)");
+  const headers = { "Content-Type": "application/json" };
+  if (a.apiKey) headers["Authorization"] = "Bearer " + a.apiKey;
+  const body = { model: a.model || "gpt-4o-mini", messages, stream: false };
+
+  // 深度思考开关。MiMo 官方文档明确:调 tool 时开着 thinking 会导致
+  // tool_calls 出现在 reasoning 里(不稳定输出)—— 实测就是这个让模型把
+  // 工具调用当文本吐出来。默认:调工具时关,纯生成时也关(提速)。
+  if (/^mimo/i.test(a.id)) {
+    const want = (opts && opts.thinking) || (opts && opts.tools === true ? "off" : ((cfg.thinking || {}).author || "off"));
+    body.thinking = { type: want === "on" ? "enabled" : "disabled" };
+  }
+  // 注意:部分供应商(实测 MiMo)不遵守 tool_choice:"none",仍会返回 tool_calls 且 content 为空。
+  // 要强制出文本,唯一可靠的做法是【根本不发 tools 参数】。
+  if (opts && opts.tools === true) {
+    body.tools = opts.schemas || toolSchemas();
+    if (!body.tools.length) { delete body.tools; }        // 全部用完就退化成纯文本对话
+    else body.tool_choice = opts.toolChoice || "auto";
+  }
+
+  if (PROGRESS.active) progressStage("thinking", "等待模型返回(" + body.messages.length + " 条上下文)…");
+
+  // 默认流式:只有流式才能把 reasoning_content(思考链)实时亮出来,
+  // 否则用户要干等几十秒,分不清是卡住还是在思考。
+  if (opts && opts.stream === false) {
+    const res0 = await fetch(a.baseUrl + "/chat/completions", { method: "POST", headers, body: JSON.stringify(body) });
+    if (!res0.ok) { const t = await res0.text(); throw new Error("模型接口 " + res0.status + ": " + t.slice(0, 300)); }
+    const j0 = await res0.json();
+    try {
+      const m0 = (j0.choices && j0.choices[0] && j0.choices[0].message) || {};
+      if (m0.reasoning_content) progressReasoning(m0.reasoning_content);
+    } catch (e) { }
+    return j0;
+  }
+
+  body.stream = true;
+  const res = await fetch(a.baseUrl + "/chat/completions", { method: "POST", headers, body: JSON.stringify(body) });
+  if (!res.ok) { const t = await res.text(); throw new Error("模型接口 " + res.status + ": " + t.slice(0, 300)); }
+  if (!res.body) { // 不支持流式就退回
+    const j1 = await res.json();
+    return j1;
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", content = "", thinking = "";
+  const tcs = [];
+  let firstTokenAt = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line || line.charAt(0) === ":") continue;
+      if (line.indexOf("data:") !== 0) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      let obj; try { obj = JSON.parse(payload); } catch (e) { continue; }
+      const d = obj.choices && obj.choices[0] && obj.choices[0].delta;
+      if (!d) continue;
+      if (!firstTokenAt) {
+        firstTokenAt = Date.now();
+        if (PROGRESS.active) progressStage("streaming", "模型已开始输出,正在接收…");
+      }
+      if (d.reasoning_content) { thinking += d.reasoning_content; progressReasoningDelta(d.reasoning_content); }
+      if (d.content) content += d.content;
+      if (d.tool_calls) {
+        for (const tc of d.tool_calls) {
+          const i = (tc.index === undefined || tc.index === null) ? 0 : tc.index;
+          if (!tcs[i]) tcs[i] = { id: "", type: "function", function: { name: "", arguments: "" } };
+          if (tc.id) tcs[i].id = tc.id;
+          if (tc.function) {
+            if (tc.function.name) tcs[i].function.name += tc.function.name;
+            if (tc.function.arguments) tcs[i].function.arguments += tc.function.arguments;
+          }
+        }
+      }
+    }
+  }
+  const msg = { role: "assistant", content: content };
+  const calls = tcs.filter(Boolean);
+  if (calls.length) msg.tool_calls = calls;
+  if (thinking && !PROGRESS.reasoning.length) progressReasoning(thinking);
+  return { choices: [{ message: msg }] };
+}
+
+function renderTrace(trace) {
+  if (!trace.length) return "";
+  const rows = trace.map(s => {
+    const argTxt = Object.keys(s.args || {}).length ? esc(JSON.stringify(s.args)) : "";
+    const body = s.ok
+      ? "<pre style='margin:6px 0 0;padding:8px;background:#f6f8fa;border-radius:6px;overflow:auto;max-height:220px;font-size:12px'>" + esc(JSON.stringify(s.data, null, 1)) + "</pre>"
+      : "<div style='color:#b00;margin-top:4px'>" + esc(String(s.error).slice(0, 400)) + "</div>";
+    return "<div style='border-left:3px solid " + (s.ok ? "#0a7" : "#c33") + ";padding:6px 10px;margin:6px 0;background:#fafbfc'>" +
+      "<div style='font-size:13px'><b>" + (s.ok ? "✅" : "❌") + " " + esc(s.name) + "</b>" +
+      (argTxt ? " <span style='color:#666'>" + argTxt + "</span>" : "") +
+      " <span style='color:#888'>· " + s.ms + " ms</span></div>" + body + "</div>";
+  }).join("");
+  return "<details style='margin-top:14px'><summary style='cursor:pointer;color:#0F789B;font-size:13px'>🔧 nx-skill 工具调用 " +
+    trace.length + " 次(点击展开)</summary>" + rows + "</details>";
+}
+
+/* ------------------------------------------------------------------ *
+ * 问答主循环(带工具调用兜底)
+ * ------------------------------------------------------------------ */
+/** 有些供应商(实测 MiMo)偶尔把工具调用当普通文本吐出来:
+ *  <tool_call><function=N><parameter=k>v</parameter></function></tool_call>
+ *  这里兜底解析,避免整轮白跑。 */
+function parseTextToolCalls(content) {
+  const out = [];
+  if (typeof content !== "string" || content.indexOf("<function=") < 0) return out;
+  const fnRe = /<function=([A-Za-z0-9_]+)>([\s\S]*?)<\/function>/g;
+  let m;
+  while ((m = fnRe.exec(content)) !== null) {
+    const name = m[1];
+    const body = m[2];
+    const args = {};
+    const pRe = /<parameter=([A-Za-z0-9_]+)>([\s\S]*?)<\/parameter>/g;
+    let p;
+    while ((p = pRe.exec(body)) !== null) {
+      const raw = p[2].trim();
+      let v = raw;
+      try { v = JSON.parse(raw); } catch (e) { /* 保留字符串 */ }
+      args[p[1]] = v;
+    }
+    out.push({ id: "textcall_" + out.length + "_" + Date.now(), type: "function", function: { name, arguments: JSON.stringify(args) } });
+  }
+  return out;
+}
+
+/** 计划刚载入队列时,在答案最上方插一条醒目指路条 */
+function renderReviewBanner(submitted, stepCount) {
+  if (!submitted) return "";
+  return "<div style='border:1px solid #0F789B;background:#eef6f9;border-radius:8px;padding:10px 12px;margin-bottom:10px'>" +
+    "<div style='font-weight:600;color:#0F789B'>✅ 计划已载入复核队列" + (stepCount ? "（" + stepCount + " 步）" : "") + "</div>" +
+    "<div style='margin-top:4px;font-size:13px'>在 Designcenter 里执行：菜单 <b>Help → NX Skill → Review Plan</b>，" +
+    "或按 <b>Ctrl+Alt+Shift+R</b>。每步可单独撤销、自动截图留痕；计划<b>不会自动运行</b>。</div></div>";
+}
+
+async function answer(question, cfg) {
+  const a = active(cfg);
+  const trace = [];
+  progressStart("chat", question);
+  try {
+    return await answerInner(question, cfg, a, trace);
+  } finally {
+    progressEnd("done");
+  }
+}
+
+async function answerInner(question, cfg, a, trace) {
+
+  if (a.id === "mock" && !question) { /* 不会发生 */ }
+
+  const messages = [
+    { role: "system", content: cfg.systemPrompt || DEFAULT_SYS },
+    { role: "user", content: question }
+  ];
+  const seen = new Map();     // 去重:同工具同参数不重复执行
+  const used = {};            // 每个工具已用次数(超过额度就从工具表摘掉)
+  let final = "";
+  const maxRounds = cfg.maxToolRounds || 6;
+  const maxCalls = cfg.maxToolCalls || 8;      // 总调用数硬上限(轮数管不住一轮多调)
+  let callCount = 0;
+
+  for (let i = 0; i <= maxRounds; i++) {
+    const schemas = availableSchemas(cfg, used);
+    const noMoreTools = i === maxRounds || callCount >= maxCalls || schemas.length === 0;
+    const j = await chatOnce(cfg, messages, noMoreTools ? { tools: false } : { tools: true, schemas });
+    const msg = (j.choices && j.choices[0] && j.choices[0].message) || {};
+    let calls = msg.tool_calls || [];
+
+    // 兜底:模型把工具调用写成了文本
+    if (!calls.length) {
+      const salvaged = parseTextToolCalls(msg.content);
+      if (salvaged.length) {
+        console.log("[ask] 兜底解析出文本形式的工具调用 " + salvaged.length + " 个");
+        calls = salvaged;
+        msg.content = String(msg.content).replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
+      }
+    }
+
+    if (!calls.length) { final = msg.content || ""; break; }
+    if (noMoreTools) { break; }
+
+    messages.push({ role: "assistant", content: msg.content || "", tool_calls: calls });
+
+    for (const c of calls) {
+      if (callCount >= maxCalls) break;
+      let args = {}; try { args = JSON.parse(c.function.arguments || "{}"); } catch (e) { }
+      const key = c.function.name + ":" + JSON.stringify(args);
+      let r;
+      if (seen.has(key)) {
+        const p = seen.get(key);
+        r = { ok: p.ok, ms: p.ms, data: p.data, error: p.error, cached: true };
+      } else {
+        progressStage("tool", "调用 " + c.function.name + " …");
+        r = await execTool(cfg, c.function.name, args);
+        progressTool(c.function.name, args, r);
+        seen.set(key, r);
+      }
+      used[c.function.name] = (used[c.function.name] || 0) + 1;
+      callCount++;
+      trace.push({ name: c.function.name, args, ok: r.ok, ms: r.ms, data: r.data, error: r.error });
+      messages.push({
+        role: "tool", tool_call_id: c.id, name: c.function.name,
+        content: JSON.stringify(r.ok ? r.data : { error: r.error }).slice(0, 6000)
+      });
+    }
+
+    // 收敛提示:只剩少量额度时,明确要求开始作答
+    const left = maxCalls - callCount;
+    if (left <= 2) {
+      messages.push({ role: "system", content: "工具额度即将用完。如果用户的要求还没完成(例如还没提交计划),立刻用最后一次额度把它做完,然后作答;否则直接用已获得的信息给出回答。" });
+    } else if (i >= 1) {
+      messages.push({ role: "system", content: "信息够用就立刻推进:该提交就提交,该作答就作答。不要为了凑信息反复调用同一个工具(尤其不要重复搜索同类 API)。" });
+    }
+  }
+
+  if (!final) {
+    // 最终兜底:不带 tools 再要一次纯文本
+    messages.push({ role: "system", content: "现在只用已经拿到的信息,用简体中文给出完整回答;如果用户要求提交计划而还没提交,请把它做完。" });
+    try {
+      const j2 = await chatOnce(cfg, messages, { tools: false });
+      let c2 = ((j2.choices || [{}])[0].message || {}).content || "";
+      // 最后一搏:模型把工具调用写成文本时,这里真的执行掉(通常就是 nx_review_submit)
+      const late = parseTextToolCalls(c2);
+      for (const c of late) {
+        let args = {}; try { args = JSON.parse(c.function.arguments || "{}"); } catch (e) { }
+        console.log("[ask] 兜底轮执行文本形式工具调用: " + c.function.name);
+        const r = await execTool(cfg, c.function.name, args);
+        trace.push({ name: c.function.name, args, ok: r.ok, ms: r.ms, data: r.data, error: r.error });
+      }
+      final = c2;
+    } catch (e) { }
+  }
+  // 收尾:把残留的工具调用标记从正文清掉,别让用户看到裸标签
+  if (final) {
+    final = String(final)
+      .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+      .replace(/<\/?function[^>]*>/g, "")
+      .replace(/<\/?parameter[^>]*>/g, "")
+      .trim();
+  }
+  if (!final) final = "（模型未能在额度内给出文本答复。请把问题拆小,或把「最大工具调用数」调大后重试。）";
+
+  // 本次是否把计划写进了复核队列 —— 页面据此"自动载入"复核选项卡
+  const submitted = trace.some(t => t.name === "nx_review_submit" && t.ok);
+  const stepCount = submitted
+    ? ((trace.filter(t => t.name === "nx_review_submit" && t.ok).pop().data || {}).stepCount || null)
+    : null;
+
+  return {
+    html: renderReviewBanner(submitted, stepCount) + toHtml(final) + renderTrace(trace),
+    trace, provider: a.id, model: a.model, reviewSubmitted: submitted, stepCount
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 一次性生成计划并载入复核队列(不依赖模型的多轮工具调用)
+ * 实测:长工具链上模型会把额度全花在查 API 上,计划反而交不出来。
+ * 这里改成"单次请求 + 严格 JSON 契约 + 服务端校验 + 失败带错误重试一次"。
+ * ------------------------------------------------------------------ */
+/** 给模型的"示范":一份已通过语法与 API 名双重校验的完整计划样例 */
+/** 给模型的"示范":一份**在 headless NX 里实际跑通过**的计划样例。
+ * 三条实机验证出来的坑(文档与静态检查都看不出来):
+ *   Origin     必须是 NXOpen.Point3d —— 传 Point 对象或 Vector3d 都报 "Expecting NXOpen.Point3d"
+ *   Direction  必须是 NXOpen.Vector3d —— 传 CreateDirection 返回的 Direction 对象报 "Expecting NXOpen.Vector3d"
+ *   布尔目标   用 BooleanOption.SetTargetBodies(list(...)) 这个方法;没有 TargetBodies 属性
+ */
+const EXAMPLE_RECIPE = ["import math", "import NXOpen", "", "", "def cylinder(part, x, y, z, dia, h, create):", "    b = part.Features.CreateCylinderBuilder(None)", "    b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "    b.Origin = NXOpen.Point3d(x, y, z)", "    b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "    b.Diameter.RightHandSide = str(dia)", "    b.Height.RightHandSide = str(h)", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    b.BooleanOption.Type = C.Create if create else C.Subtract", "    if not create:", "        bodies = list(part.Bodies)", "        if bodies:", "            b.BooleanOption.SetTargetBodies(bodies)", "    f = b.Commit()", "    b.Destroy()", "    return f", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    if part is None:", "        raise RuntimeError('no work part')", "    f = cylinder(part, 0.0, 0.0, 0.0, 200, 20, True)", "    f.SetName('01_Flange_Disc')", "", "", "if __name__ == '__main__':", "    main()"].join("\n");
+const EXAMPLE_PLAN = JSON.stringify({
+  prompt: "在法兰盘上做中心通孔和 6 个螺栓孔",
+  partPath: "",
+  steps: [
+    { name: "01_Create_Flange_Disc", operation: "journal", gate: "auto",
+      params: { path: "01_Create_Flange_Disc.py" }, note: "法兰盘体 OD200 H20", script: EXAMPLE_RECIPE },
+    { name: "02_Bolt_Holes_Six", operation: "journal", gate: "manual",
+      params: { path: "02_Bolt_Holes_Six.py" }, note: "O160 分度圆上 6xO16 螺栓孔(布尔求差)",
+      script: ["import math", "import NXOpen", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    for i in range(6):", "        a = 2.0 * math.pi * i / 6.0", "        b = part.Features.CreateCylinderBuilder(None)", "        b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "        b.Origin = NXOpen.Point3d(80.0 * math.cos(a), 80.0 * math.sin(a), -5.0)", "        b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "        b.Diameter.RightHandSide = '16'", "        b.Height.RightHandSide = '30'", "        b.BooleanOption.Type = C.Subtract", "        bodies = list(part.Bodies)", "        if bodies:", "            b.BooleanOption.SetTargetBodies(bodies)", "        f = b.Commit()", "        f.SetName('02_Bolt_Hole_%02d' % (i + 1))", "        b.Destroy()", "", "", "if __name__ == '__main__':", "    main()"].join("\n") },
+    { name: "03_Review_Screenshot", operation: "screenshot", gate: "manual", params: {}, note: "人工检查" }
+  ]
+}, null, 1);
+
+function extractJson(text) {
+  if (!text) return null;
+  let s = String(text).trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) s = fence[1].trim();
+  const a = s.indexOf("{"), b = s.lastIndexOf("}");
+  if (a < 0 || b <= a) return null;
+  try { return JSON.parse(s.slice(a, b + 1)); } catch (e) { return null; }
+}
+
+async function authorPlan(cfg, question, partName) {
+  const contract = [
+    "你是 NX 建模计划生成器。只输出 JSON,不要任何解释、不要 markdown 代码块以外的文字。",
+    "输出格式:",
+    '{"prompt":"用户需求原文","partPath":"","steps":[{"name":"01_Xxx_Yyy","operation":"journal|create_block|screenshot|status|noop","gate":"auto|manual","params":{"path":"01_Xxx_Yyy.py"},"script":"<NXOpen Python 源码>","note":"中文说明"}]}',
+    "规则:",
+    "1. 步骤名必须是 NN_Short_Action_Object(两位编号);步骤要覆盖用户要求的每个特征,不要只给一步。",
+    "2. 需要几何操作用 operation=journal,并在 script 里给出完整可运行的 NXOpen Python 源码;params.path 用与步骤名一致的 .py 文件名。",
+    "3. 脚本必须含 def main(): 与 if __name__ == '__main__': main();不要用 f-string;只 import NXOpen/NXOpen.xxx;操作 session.Parts.Work;不要 Save/Export;不要自己调 SetUndoMark/UndoToMark。",
+    "4. 破坏性步骤(切除、布尔、保存、导出、求解)用 gate=manual;基础体/参考几何可用 gate=auto。",
+    "5. 最后一步建议 operation=screenshot、gate=manual,供人工检查。",
+    "6. 脚本里用到的 NXOpen 名字必须是真实存在的;系统会逐个校验,错了会把正确拼写告诉你。",
+    "已核验的写法(在 headless NX 里实跑通过,照抄):builder 用 None 作参数;",
+    "b.Origin = NXOpen.Point3d(x, y, z)  <-- 必须是 Point3d;传 Point 对象或 Vector3d 都会报错;",
+    "b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)  <-- 必须是 Vector3d!不要用 part.Directions.CreateDirection(...),它返回 Direction 对象,会报 Expecting NXOpen.Vector3d;",
+    "b.Diameter.RightHandSide = 直径字符串 / b.Height.RightHandSide = 高度字符串;",
+    "布尔:b.BooleanOption.Type = NXOpen.GeometricUtilities.BooleanOperation.BooleanType.Create 或 .Subtract;",
+    "求差要给目标体,而且用【方法】:b.BooleanOption.SetTargetBodies(list(part.Bodies)) —— 没有 TargetBodies 这个属性;",
+    "提交 f = b.Commit()、命名 f.SetName('NN_Xxx')、清理 b.Destroy()。",
+    "",
+    "可用的建模 builder(全部已核验存在,直接用,不要自己造名字):\n  实体  : CreateBlockFeatureBuilder / CreateCylinderBuilder\n  特征  : CreateExtrudeBuilder / CreateRevolveBuilder\n  孔    : CreateHoleFeatureBuilder\n  倒角  : CreateChamferBuilder(对应 NXOpen.Features.ChamferBuilder)\n  圆角  : CreateEdgeBlendBuilder(对应 NXOpen.Features.EdgeBlendBuilder)\n  螺纹  : CreateThreadBuilder\n  统一写法:builder = part.Features.CreateXxxBuilder(None); ... ; f = builder.Commit(); f.SetName('NN_...'); builder.Destroy()\n**不存在**这些名字,别用:NXOpen.Features.SlotBuilder / GrooveBuilder / CountersinkBuilder / Sketches / Datums。\n要做键槽/凹槽/切口(没有专用 builder 的情况下),标准做法是:用一个小实体当刀具 ——\n  建一个 Block 或 Cylinder 放在要切的位置,然后 BooleanOption.Type = ...BooleanType.Subtract,\n  BooleanOption.TargetBodies = list(part.Bodies)。这和中心通孔的做法完全一样,只是把圆柱换成方块。\n倒角/圆角需要先选中边:用 part.Edges 或从已建对象的 body 上取边赋给 builder 的对应属性;\n拿不准某个属性名时,先调 nx_docs_member 查一次,不要猜。",
+    "倒角(实测最容易踩坑):NXOpen.Features.ChamferBuilder.ChamferOption 的合法取值是 SymmetricOffsets / TwoOffsets / OffsetAndAngle —— 没有 Symmetric。写法:cb = part.Features.CreateChamferBuilder(None); cb.Option = NXOpen.Features.ChamferBuilder.ChamferOption.SymmetricOffsets; cb.FirstOffset.RightHandSide = '2'; 设好边集后 cb.Commit()。如果边集(SmartCollector)用法无法确证,就不要写这一步:降级为 operation=noop、gate=manual,note 里写明让用户手工倒角。任何无法确证成员名的特征,一律降级为 manual 人工步骤 —— 宁少一步也不写错。",
+    "下面是一份**已通过全部校验的真实样例**。**只学它的写法与结构,尺寸/特征/步骤数必须按用户实际需求来,严禁照抄样例内容。**",
+    EXAMPLE_PLAN
+  ].join("\n");
+
+  const messages = [
+    { role: "system", content: contract },
+    { role: "user", content: "需求:" + question + (partName ? "\n零件名:" + partName : "") }
+  ];
+
+  progressStart("author", question);
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    PROGRESS.attempts = attempt;
+    progressStage("authoring", attempt === 1 ? "正在生成计划 JSON 与 NXOpen 脚本…" : "第 " + attempt + " 次修正后重新生成…");
+    const j = await chatOnce(cfg, messages, { tools: false });
+    const text = ((j.choices || [{}])[0].message || {}).content || "";
+    const plan = extractJson(text);
+    if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) {
+      lastErr = "模型没有返回合法的计划 JSON";
+      messages.push({ role: "assistant", content: text.slice(0, 2000) });
+      messages.push({ role: "user", content: "这不是合法 JSON。请只输出 JSON 对象本身。" });
+      continue;
+    }
+    progressStage("validating", "校验脚本语法与 NXOpen API 名…");
+    const res = await execTool(cfg, "nx_review_submit", {
+      prompt: plan.prompt || question, partPath: plan.partPath || "", steps: plan.steps
+    });
+    progressTool("nx_review_submit", { attempt: attempt }, res);
+    if (res.ok) {
+      progressEnd("done");
+      return { ok: true, attempt, planId: (res.data || {}).planId, stepCount: (res.data || {}).stepCount, steps: (res.data || {}).steps, raw: res.data };
+    }
+    lastErr = res.error || "提交被拒";
+    console.log("[author] 第" + attempt + "次提交被拒: " + String(lastErr).replace(/\s+/g, " ").slice(0, 400));
+    progressStage("retry", "校验未通过,把正确写法回给模型重写…");
+    messages.push({ role: "assistant", content: text.slice(0, 4000) });
+    messages.push({ role: "user", content: "校验未通过,请修正后重新输出完整 JSON。\n如果某个特征你无法确证 API,就把它降级成 operation=noop、gate=manual 的人工步骤(note 里写明让用户在 NX 里手工做什么),不要为了凑步骤去猜 API 名。\n错误:\n" + String(lastErr).slice(0, 1500) });
+  }
+  progressEnd("failed");
+  return { ok: false, error: lastErr, attempts: 3 };
+}
+
+/* ------------------------------------------------------------------ */
+function serve(file, res, onMissing) {
+  fs.readFile(file, (err, buf) => {
+    if (err) { onMissing(); return; }
+    res.writeHead(200, { "Content-Type": MIME[path.extname(file).toLowerCase()] || "application/octet-stream" });
+    res.end(buf);
+  });
+}
+function readBody(req, cb) { let raw = ""; req.on("data", c => raw += c); req.on("end", () => cb(raw)); }
+const sendJson = (res, o) => { res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify(o)); };
+
+/* 最近的请求记录,便于判断"NX 是否真的连上了我们" */
+const RECENT = [];
+function note(req, extra) {
+  const ua = String(req.headers["user-agent"] || "");
+  const from = /WebView2|Edg\//i.test(ua) ? "WebView2/NX" : (ua.slice(0, 30) || "?");
+  const line = new Date().toLocaleTimeString("zh-CN") + "  " + req.method + " " + req.url + "  ← " + from + (extra ? "  " + extra : "");
+  RECENT.push(line);
+  if (RECENT.length > 60) RECENT.shift();
+  console.log("[req] " + line);
+}
+
+const server = http.createServer(async (req, res) => {
+  const parsed = url.parse(req.url, true);
+  if (parsed.pathname !== "/favicon.ico") note(req);
+
+  /* ---- 伪 OpenAI:无真实模型时自测工具闭环 ---- */
+  if (req.method === "POST" && parsed.pathname === "/mock/v1/chat/completions") {
+    readBody(req, (raw) => {
+      let body = {}; try { body = JSON.parse(raw || "{}"); } catch (e) { }
+      const msgs = body.messages || [];
+      const lastUser = [...msgs].reverse().find(m => m.role === "user");
+      const toolMsgs = msgs.filter(m => m.role === "tool");
+      const hasTools = Array.isArray(body.tools) && body.tools.length;
+      const noTools = body.tool_choice === "none";
+      let out;
+      if (hasTools && !noTools && !toolMsgs.length) {
+        const q = (lastUser && lastUser.content) || "";
+        const call = /NXOpen|API|成员|类型/.test(q) ? { name: "nx_docs_search", args: { query: "ExtrudeBuilder" } } : { name: "nx_status", args: {} };
+        out = { role: "assistant", content: null, tool_calls: [{ id: "call_mock_1", type: "function", function: { name: call.name, arguments: JSON.stringify(call.args) } }] };
+      } else if (toolMsgs.length) {
+        out = { role: "assistant", content: "已通过工具查证:\n" + toolMsgs.map(m => "· " + m.name).join("\n") + "\n\n(mock 模型,用于验证工具闭环)" };
+      } else {
+        out = { role: "assistant", content: "mock: " + ((lastUser && lastUser.content) || "") };
+      }
+      sendJson(res, { choices: [{ message: out }] });
+    });
+    return;
+  }
+
+  /* ---- 聊天后端 ---- */
+  if (req.method === "POST" && parsed.pathname === "/api/ask") {
+    readBody(req, async (raw) => {
+      let q = ""; try { q = JSON.parse(raw || "{}").question || ""; } catch (e) { }
+      const cfg = loadConfig();
+      const t0 = Date.now();
+      try {
+        const a = await answer(q, cfg);
+        console.log("[ask] 问题:" + q.slice(0, 40) + " | 供应商:" + a.provider + " | 工具:" + a.trace.length + " | " + (Date.now() - t0) + "ms");
+        sendJson(res, { data: { answer: a.html }, meta: { provider: a.provider, model: a.model, ms: Date.now() - t0, tools: a.trace.length, reviewSubmitted: !!a.reviewSubmitted, stepCount: a.stepCount || null } });
+      } catch (e) {
+        sendJson(res, { data: { answer: "<p><b>后端出错:</b>" + esc(e.message) + "</p>" }, meta: { ms: Date.now() - t0 } });
+      }
+    });
+    return;
+  }
+
+  /* ---- 设置:读 ---- */
+  if (req.method === "GET" && parsed.pathname === "/api/settings") {
+    const cfg = loadConfig();
+    const a = active(cfg);
+    sendJson(res, {
+      ok: true,
+      activeProvider: cfg.activeProvider,
+      active: { id: a.id, label: a.label, baseUrl: a.baseUrl, model: a.model, apiKeyMasked: mask(a.apiKey), hasKey: !!a.apiKey },
+      providers: Object.entries(PRESETS).map(([id, p]) => {
+        const cur = cfg.providers[id] || {};
+        return { id, label: p.label, presetBaseUrl: p.baseUrl, presetModel: p.model, models: p.models || [],
+                 baseUrl: cur.baseUrl || p.baseUrl || "", model: cur.model || p.model || "", hasKey: !!cur.apiKey, apiKeyMasked: mask(cur.apiKey) };
+      }),
+      systemPrompt: cfg.systemPrompt,
+      nx: { nxSkillRoot: cfg.nxSkillRoot, nxRoot: cfg.nxRoot, nxWorkspace: cfg.nxWorkspace, maxToolRounds: cfg.maxToolRounds, toolTimeoutMs: cfg.toolTimeoutMs },
+      tools: Object.keys(TOOLS)
+    });
+    return;
+  }
+
+  /* ---- 设置:写 ---- */
+  if (req.method === "POST" && parsed.pathname === "/api/settings") {
+    readBody(req, (raw) => {
+      let b = {}; try { b = JSON.parse(raw || "{}"); } catch (e) { }
+      const cfg = loadConfig();
+      if (b.activeProvider) cfg.activeProvider = b.activeProvider;
+      if (b.provider && b.provider.id) {
+        const id = b.provider.id;
+        const cur = cfg.providers[id] || {};
+        const next = Object.assign({}, cur);
+        if (typeof b.provider.baseUrl === "string") next.baseUrl = b.provider.baseUrl.trim();
+        if (typeof b.provider.model === "string") next.model = b.provider.model.trim();
+        // apiKey 为空字符串 = 不改动;传 null = 清空
+        if (b.provider.apiKey === null) next.apiKey = "";
+        else if (typeof b.provider.apiKey === "string" && b.provider.apiKey.trim()) next.apiKey = b.provider.apiKey.trim();
+        cfg.providers[id] = next;
+      }
+      if (typeof b.systemPrompt === "string") cfg.systemPrompt = b.systemPrompt;
+      if (b.nx) {
+        for (const k of ["nxSkillRoot", "nxRoot", "nxWorkspace"]) if (typeof b.nx[k] === "string") cfg[k] = b.nx[k].trim();
+        if (b.nx.maxToolRounds) cfg.maxToolRounds = Number(b.nx.maxToolRounds) || 8;
+      }
+      saveConfig(cfg);
+      sendJson(res, { ok: true });
+    });
+    return;
+  }
+
+  /* ---- 设置:测试连接 ---- */
+  if (req.method === "POST" && parsed.pathname === "/api/settings/test") {
+    readBody(req, async (raw) => {
+      let b = {}; try { b = JSON.parse(raw || "{}"); } catch (e) { }
+      const cfg = loadConfig();
+      // 允许用面板里尚未保存的值直接测
+      if (b.provider && b.provider.id) {
+        cfg.providers[b.provider.id] = Object.assign({}, cfg.providers[b.provider.id], {
+          baseUrl: b.provider.baseUrl || (cfg.providers[b.provider.id] || {}).baseUrl,
+          model: b.provider.model || (cfg.providers[b.provider.id] || {}).model
+        });
+        if (b.provider.apiKey && b.provider.apiKey.trim()) cfg.providers[b.provider.id].apiKey = b.provider.apiKey.trim();
+        if (b.useThis) cfg.activeProvider = b.provider.id;
+      }
+      const a = active(cfg);
+      const t0 = Date.now();
+      try {
+        const headers = { "Content-Type": "application/json" };
+        if (a.apiKey) headers["Authorization"] = "Bearer " + a.apiKey;
+        const r = await fetch(a.baseUrl + "/chat/completions", {
+          method: "POST", headers,
+          body: JSON.stringify({ model: a.model, messages: [{ role: "user", content: "只回复两个字:正常" }], stream: false })
+        });
+        const txt = await r.text();
+        let ok = r.ok, reply = "", extra = "";
+        try {
+          const j = JSON.parse(txt);
+          reply = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
+          if (!ok && j.error) extra = j.error.message || JSON.stringify(j.error).slice(0, 200);
+        } catch (e) { extra = txt.slice(0, 200); }
+        sendJson(res, { ok, ms: Date.now() - t0, provider: a.id, model: a.model, baseUrl: a.baseUrl, reply: String(reply).slice(0, 200), error: extra });
+      } catch (e) {
+        sendJson(res, { ok: false, ms: Date.now() - t0, provider: a.id, model: a.model, baseUrl: a.baseUrl, error: String(e.message || e) });
+      }
+    });
+    return;
+  }
+
+  /* ---- 连通性自检(NX 面板里也能打开这个地址看) ---- */
+  if (parsed.pathname === "/api/ping") {
+    sendJson(res, { ok: true, time: new Date().toLocaleString("zh-CN"), provider: active(loadConfig()).label, tools: Object.keys(TOOLS).length });
+    return;
+  }
+  if (parsed.pathname === "/api/log") {
+    sendJson(res, { ok: true, count: RECENT.length, recent: RECENT });
+    return;
+  }
+
+  /* ---- 复核队列(页面面板用) ---- */
+  if (req.method === "GET" && parsed.pathname === "/api/review") {
+    const cfg = loadConfig();
+    const ws = cfg.nxWorkspace || "";
+    const dir = ws ? path.join(ws, "review") : "";
+    const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return null; } };
+    const plan = dir ? readJson(path.join(dir, "plan.json")) : null;
+    const log = dir ? readJson(path.join(dir, "run.json")) : null;
+    const byId = {};
+    ((log && log.records) || []).forEach(r => { byId[r.id] = r; });
+    const steps = ((plan && plan.steps) || []).map(s => {
+      const r = byId[s.id] || {};
+      return { id: s.id, name: s.name, operation: s.operation, gate: s.gate, note: s.note || "",
+               status: r.status || "pending", ms: Math.round((r.durationSeconds || 0) * 1000),
+               message: r.message || "", screenshot: r.screenshot || "" };
+    });
+    // 直接读注册表:本进程的环境是启动时的快照,setx 之后不会更新,
+    // 而新启动的 Designcenter 会从注册表拿到新值 —— 要比较的是后者。
+    const envWs = machineEnv("NX_SKILL_WORKSPACE") || machineEnv("NX2512_PROJECT_ROOT") || machineEnv("DC2512_PROJECT_ROOT") || "";
+    const norm = (s) => String(s || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    sendJson(res, {
+      ok: true, workspace: ws, reviewDir: dir,
+      envWorkspace: envWs,
+      workspaceMismatch: !!envWs && norm(envWs) !== norm(ws),
+      planPath: dir ? path.join(dir, "plan.json") : "",
+      hasPlan: !!plan,
+      plan: plan ? { planId: plan.planId, prompt: plan.prompt || "", partPath: plan.partPath || "", created: plan.created } : null,
+      steps, counts: (log && log.counts) || null, updated: (log && log.updated) || null,
+      nextAction: plan ? "在 Designcenter 里打开:NX Skill → Review Plan" : "还没有计划。让 AI 出个计划并点「提交到复核队列」。"
+    });
+    return;
+  }
+  if (req.method === "POST" && parsed.pathname === "/api/review/clear") {
+    readBody(req, async () => {
+      const cfg = loadConfig();
+      const r = await runNxSkill(cfg, ["review", "clear"], cfg.toolTimeoutMs);
+      sendJson(res, { ok: (r.envelope && r.envelope.ok) || false, result: (r.envelope && r.envelope.result) || null, stderr: r.stderr || "" });
+    });
+    return;
+  }
+
+  /* ---- 清理 ---- */
+  if (req.method === "POST" && parsed.pathname === "/api/cleanup") {
+    readBody(req, (raw) => {
+      let b = {}; try { b = JSON.parse(raw || "{}"); } catch (e) { }
+      sendJson(res, runCleanup(b.scope || "all", "手动清理"));
+    });
+    return;
+  }
+  if (parsed.pathname === "/api/cleanup") { sendJson(res, { last: LAST_CLEANUP, policy: loadConfig().cleanupOnNxExit || "all", nxRunning: nxRunning() }); return; }
+
+  /* ---- 进度 / 思维链 ---- */
+  if (parsed.pathname === "/api/progress") {
+    sendJson(res, {
+      active: PROGRESS.active, kind: PROGRESS.kind, question: PROGRESS.question,
+      stage: PROGRESS.stage, detail: PROGRESS.detail,
+      elapsedMs: PROGRESS.started ? Date.now() - PROGRESS.started : 0,
+      attempts: PROGRESS.attempts,
+      tools: PROGRESS.tools.slice(-12),
+      reasoning: [PROGRESS.reasoning.join("")]
+    });
+    return;
+  }
+
+  /* ---- 生成计划:默认异步(长请求会被浏览器/WebView2 掐断) ---- */
+  if (req.method === "POST" && parsed.pathname === "/api/plan/author") {
+    readBody(req, async (raw) => {
+      let b = {}; try { b = JSON.parse(raw || "{}"); } catch (e) { }
+      const t0 = Date.now();
+      const run = async () => {
+        try {
+          const out = await authorPlan(loadConfig(), b.question || "", b.partName || "");
+          console.log("[author] " + (out.ok ? "成功 第" + out.attempt + "次 计划 " + out.planId : "失败: " + out.error) + " | " + (Date.now() - t0) + "ms");
+          return Object.assign({ ms: Date.now() - t0 }, out);
+        } catch (e) {
+          return { ok: false, error: String(e.message || e), ms: Date.now() - t0 };
+        }
+      };
+      if (b.wait === true) { sendJson(res, await run()); return; }   // 调试用:同步等
+      const id = "job" + (++JOB_SEQ);
+      JOBS.set(id, { id, state: "running", started: Date.now(), question: b.question || "", result: null });
+      sendJson(res, { ok: true, async: true, jobId: id });           // 立刻回,不再让前端干等
+      run().then((r) => { const j = JOBS.get(id); if (j) { j.state = r.ok ? "done" : "failed"; j.result = r; j.ended = Date.now(); } });
+      for (const [k, v] of JOBS) if (v.ended && Date.now() - v.ended > 3600000) JOBS.delete(k);
+    });
+    return;
+  }
+  if (req.method === "GET" && parsed.pathname === "/api/plan/author/status") {
+    const id = parsed.query.id;
+    const j = JOBS.get(id);
+    if (!j) { sendJson(res, { ok: false, error: "unknown job" }); return; }
+    sendJson(res, {
+      ok: true, id: j.id, state: j.state, question: j.question,
+      elapsedMs: (j.ended || Date.now()) - j.started,
+      result: j.result
+    });
+    return;
+  }
+
+  /* ---- 自动执行当前队列里的计划(headless 批处理) ---- */
+  if (req.method === "POST" && parsed.pathname === "/api/plan/run") {
+    readBody(req, async (raw) => {
+      let b = {}; try { b = JSON.parse(raw || "{}"); } catch (e) { }
+      const cfg = loadConfig();
+      const live = b.mode === "live";
+      const run = async () => {
+        const t0 = Date.now();
+        try {
+          const out = live ? await runPlanLive(cfg) : await runPlanBatch(cfg);
+          console.log("[run] " + (out.ok ? "成功 零件 " + out.part : "失败: " + out.error) + " | " + (Date.now() - t0) + "ms");
+          return Object.assign({ ms: Date.now() - t0 }, out);
+        } catch (e) { return { ok: false, error: String(e.message || e), ms: Date.now() - t0 }; }
+      };
+      if (b.wait === true) { sendJson(res, await run()); return; }
+      const id = "run" + (++JOB_SEQ);
+      JOBS.set(id, { id, state: "running", started: Date.now(), result: null });
+      sendJson(res, { ok: true, async: true, jobId: id });
+      run().then((r) => { const j = JOBS.get(id); if (j) { j.state = r.ok ? "done" : "failed"; j.result = r; j.ended = Date.now(); } });
+    });
+    return;
+  }
+  if (req.method === "GET" && parsed.pathname === "/api/plan/run/status") {
+    const j = JOBS.get(parsed.query.id);
+    if (!j) { sendJson(res, { ok: false, error: "unknown job" }); return; }
+    sendJson(res, { ok: true, id: j.id, state: j.state, elapsedMs: (j.ended || Date.now()) - j.started, result: j.result });
+    return;
+  }
+
+  /* ---- 脚本预检(不写盘、不提交) ---- */
+  if (req.method === "POST" && parsed.pathname === "/api/nxopen/check") {
+    readBody(req, (raw) => {
+      let b = {}; try { b = JSON.parse(raw || "{}"); } catch (e) { }
+      const src = String(b.script || "");
+      const idx = nxopenIndex();
+      sendJson(res, {
+        ok: true,
+        indexSize: idx.size,
+        syntax: (() => { const fsx = require("fs"), osx = require("os"); const f = path.join(osx.tmpdir(), "precheck_" + Date.now() + ".py"); fsx.writeFileSync(f, src, "utf8"); const r = require("child_process").spawnSync("python", ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", f], { encoding: "utf8", windowsHide: true }); try { fsx.unlinkSync(f); } catch (e) { } return r.status === 0 ? { ok: true } : { ok: false, error: ((r.stderr || "") + (r.stdout || "")).trim().split("\n").slice(-5).join("\n") }; })(),
+        api: checkNxOpenNames(src)
+      });
+    });
+    return;
+  }
+
+  /* ---- 工具 ---- */
+  if (parsed.pathname === "/api/tools") { sendJson(res, Object.keys(TOOLS)); return; }
+  if (req.method === "POST" && parsed.pathname === "/api/tool") {
+    readBody(req, async (raw) => {
+      let b = {}; try { b = JSON.parse(raw || "{}"); } catch (e) { }
+      sendJson(res, await execTool(loadConfig(), b.name, b.args || {}));
+    });
+    return;
+  }
+
+  if (parsed.pathname === "/favicon.ico") { res.writeHead(204); res.end(); return; }
+
+  let p = decodeURIComponent(parsed.pathname);
+  if (p === "/") p = "/index.html";
+  const file = path.join(ROOT, path.normalize(p).replace(/^([/\\])+/, ""));
+  if (!file.startsWith(ROOT)) { res.writeHead(403); res.end("forbidden"); return; }
+
+  serve(file, res, () => {
+    const base = path.basename(p);
+    serve(path.join(ROOT, "plchat_v2", "assets", "images", base), res, () => {
+      serve(path.join(ROOT, "plchat_v2", "assets", "config", base), res, () => {
+        res.writeHead(404); res.end("not found: " + p);
+      });
+    });
+  });
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  const cfg = loadConfig();
+  const a = active(cfg);
+  console.log("Designcenter Copilot 本地宿主: http://127.0.0.1:" + PORT + "/");
+  console.log("当前供应商 = " + a.id + "(" + a.label + ") · 模型 = " + (a.model || "(未设)") + " · 工具 " + Object.keys(TOOLS).length + " 个");
+  const pol = cfg.cleanupOnNxExit || "all";
+  console.log("退出清理策略 cleanupOnNxExit = " + pol + " · 启动时先清一次运行残留");
+  if (pol !== "off") runCleanup("scratch", "宿主启动");
+  startNxExitWatcher();
+});
