@@ -52,6 +52,23 @@ _PRODUCT_NAME = re.compile(
 #: A trailing release token such as "2512" in "NX 2512" or "DC 2606".
 _RELEASE_TOKEN = re.compile(r"(?<![0-9])(\d{4})(?![0-9])")
 
+#: Structural fingerprint of the built-in Designcenter Copilot feature, strongest
+#: first. Recognised by what is on disk, never by release number, so any release
+#: that ships the feature (2606, 2506, 2406, 2306, ...) is identified the same way.
+#: Names inside an install can differ between releases; these are the markers that
+#: hold across them, and the page is the one the local host mirrors.
+COPILOT_MARKERS: tuple[tuple[str, str], ...] = (
+    ("page", "UGII/copilot/plchat/PLChat.html"),
+    ("plchat_dir", "UGII/copilot/plchat"),
+    ("copilot_dir", "UGII/copilot"),
+)
+
+#: The Copilot engine libraries live in NXBIN next to the other NX libraries.
+#: Globbed rather than enumerated: 2606 ships libcopilot / libcopilotui /
+#: libcopilotinit / libcopilotuiinit, other releases may name them differently.
+COPILOT_LIB_DIR = "NXBIN"
+COPILOT_LIB_GLOB = "libcopilot*"
+
 _SKIP_DIR_NAMES = {
     "$recycle.bin",
     "system volume information",
@@ -92,6 +109,38 @@ class NxNotFound(SkillError):
             ),
             details={"require": require, "checked": self.checked[:40]},
         )
+
+
+@dataclass(frozen=True)
+class CopilotProbe:
+    """What the built-in Copilot feature looks like inside one installation.
+
+    ``available`` is a claim about the installation, not about a release: it means
+    the markers below were found on disk. ``page_available`` narrows it to the
+    case the local host can actually work with -- the page scripts that
+    ``plchat-local/fetch-frontend.sh`` mirrors. An install can have the engine
+    libraries without the page (then it has the AI, but there is nothing to host).
+    """
+
+    available: bool = False
+    markers: tuple[str, ...] = ()
+    page: Path | None = None
+    scripts_dir: Path | None = None
+    libraries: tuple[Path, ...] = ()
+
+    @property
+    def page_available(self) -> bool:
+        return self.page is not None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "available": self.available,
+            "pageAvailable": self.page_available,
+            "markers": list(self.markers),
+            "page": str(self.page) if self.page else None,
+            "scriptsDir": str(self.scripts_dir) if self.scripts_dir else None,
+            "libraries": [str(p) for p in self.libraries],
+        }
 
 
 @dataclass(frozen=True)
@@ -172,6 +221,11 @@ class NxInstall:
             raise KeyError(f"unknown requirement {requirement!r}")
         return all((self.root / rel).exists() for rel in rels)
 
+    @property
+    def copilot(self) -> CopilotProbe:
+        """The built-in Designcenter Copilot feature, when this install ships it."""
+        return detect_copilot(self.root)
+
     def to_dict(self) -> dict[str, object]:
         stubs = self.python_stubs
         return {
@@ -187,6 +241,7 @@ class NxInstall:
             "examples": str(self.examples) if self.examples else None,
             "apiXmlDocCount": len(self.api_xml_docs),
             "capabilities": sorted(self.capabilities),
+            "copilot": self.copilot.to_dict(),
         }
 
 # ---------------------------------------------------------------------------
@@ -260,7 +315,50 @@ def detect_capabilities(root: Path) -> frozenset[str]:
         caps.add("python_modules")
     if (root / "NXBIN" / "managed" / "NXOpen.xml").exists():
         caps.add("api_docs")
+    # 内置 Copilot:按结构特征判断,与 release 无关 —— 2606 / 2506 / 2406 / 2306 ...
+    # 只要装了这一版并且带这套文件,能力就是 copilot。
+    if detect_copilot(root).available:
+        caps.add("copilot")
     return frozenset(caps)
+
+
+def detect_copilot(root: Path) -> CopilotProbe:
+    """Report whether *root* ships the built-in Designcenter Copilot feature.
+
+    Structural, never release-based: the files decide, not the version number, so
+    a release that carries the feature is recognised whether or not this package
+    has heard of it. An install without the feature yields an empty probe
+    (``available`` false, no markers), which is also what a non-NX directory gets.
+    """
+    markers: list[str] = []
+    page: Path | None = None
+    scripts_dir: Path | None = None
+    for name, rel in COPILOT_MARKERS:
+        path = root.joinpath(*rel.split("/"))
+        hit = path.is_file() if name == "page" else path.is_dir()
+        if not hit:
+            continue
+        markers.append(name)
+        if name == "page":
+            page = path
+        elif name == "plchat_dir":
+            scripts_dir = path
+    libraries: list[Path] = []
+    lib_dir = root / COPILOT_LIB_DIR
+    if lib_dir.is_dir():
+        try:
+            libraries = sorted(p for p in lib_dir.glob(COPILOT_LIB_GLOB) if p.is_file())
+        except OSError:
+            libraries = []
+    if libraries:
+        markers.append("ai_libs")
+    return CopilotProbe(
+        available=bool(markers),
+        markers=tuple(markers),
+        page=page,
+        scripts_dir=scripts_dir,
+        libraries=tuple(libraries),
+    )
 
 
 def detect_release(root: Path, explicit: str | None = None) -> str:

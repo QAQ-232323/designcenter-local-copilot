@@ -23,7 +23,28 @@ def main(script_path, params_json="{}"):
         os.environ["NX_SKILL_PARAMS_JSON"] = "{}"
         os.environ["NX_CODEX_PARAMS_JSON"] = "{}"
 
-    result_globals = runpy.run_path(full_path, run_name="__main__")
+    try:
+        result_globals = runpy.run_path(full_path, run_name="__main__")
+    except Exception:
+        # NX 对外只会说"无法执行 python 脚本,请参见系统日志"——对调用方毫无信息量,
+        # 而真正的 traceback(常见:用了 NXOpen.Features.X 却没 import NXOpen.Features)
+        # 只落在系统日志里。所以这里把它落到脚本旁边的 .error.txt,同时写进信息窗口,
+        # 然后**原样抛出**:执行状态仍然是失败(不能被吞成"成功"),但原因可读了。
+        import traceback
+        text = traceback.format_exc()
+        try:
+            with open(full_path + ".error.txt", "w") as handle:
+                handle.write(text)
+        except Exception:
+            pass
+        try:
+            listing = NXOpen.Session.GetSession().ListingWindow
+            listing.Open()
+            listing.WriteLine("NX skill: python script failed, traceback follows")
+            listing.WriteLine(text)
+        except Exception:
+            pass
+        raise
 
     session = NXOpen.Session.GetSession()
     session.ListingWindow.Open()

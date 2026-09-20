@@ -14,7 +14,9 @@
   var LOADER_SRI = CFG.loaderSri || "";
   var BACKEND = CFG.backendUrl || "/api/ask";
   var PRODUCT = "NX_X";
-  var VERSION = CFG.version || "2606.1700";
+  // 版本来自 /local-config.js(宿主按本机安装识别出来,见 nxdetect.js);
+  // 不再写死某个版本号,取不到就报 unknown,不编造。
+  var VERSION = CFG.version || "unknown";
 
   var ICEBREAKERS = CFG.icebreakers || [
     "What command should I use to mirror a body?",

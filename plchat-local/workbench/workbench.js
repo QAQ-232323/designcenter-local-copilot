@@ -94,12 +94,46 @@
     text('key-status', provider.hasKey ? '已存密钥' : '未设置');
     $('model-options').replaceChildren(...(provider.models || []).map(value => { const option = node('option'); option.value = value; return option; }));
   }
+  /** 顶部版本徽标 + NX 环境空态 —— 全部来自宿主按结构特征扫出来的结果(nxdetect.js),
+   *  所以 2606 / 2506 / 2406 / 2306 都显示本机真实版本,不再写死。 */
+  function applyDetectedNx(nx) {
+    const active = nx && nx.detected && nx.detected.active;
+    const badge = $('edition');
+    if (!active) {
+      text('edition', 'NX / 未检测到');
+      badge.title = '没有在本机找到带 NXBIN 的 Siemens Designcenter / NX 安装';
+      text('nx-status', '未检测到 Designcenter / NX 安装');
+      $('nx-dot').className = 'status-dot error';
+      return;
+    }
+    const cap = active.hasCopilot ? '含内置 Copilot' : '未检出 Copilot';
+    const markers = ((active.copilot && active.copilot.markers) || []).join(' / ') || '(无)';
+    const libs = (active.copilot && (active.copilot.libs || []).length) || 0;
+    text('edition', 'NX / ' + active.release + (active.hasCopilot ? '' : ' · 无 Copilot'));
+    badge.title = [
+      active.product || 'Siemens ' + active.release,
+      '安装目录: ' + active.root,
+      '识别依据: ' + markers,
+      active.copilot && active.copilot.page ? '页面: ' + active.copilot.page : '未找到 PLChat.html',
+      'AI 库: ' + (libs ? libs + ' 个' : '无')
+    ].join('\n');
+    if (!nx.nxRoot) $('nx-root').placeholder = active.root;
+    if (active.hasCopilot) {
+      text('nx-status', '已识别 ' + active.release + '（' + cap + '）');
+      $('nx-dot').className = 'status-dot online';
+    } else {
+      text('nx-status', '检测到的 ' + active.release + ' 里没有内置 Copilot');
+      $('nx-dot').className = 'status-dot error';
+      feedback('environment-feedback', '该安装未检出 UGII/copilot 页面或 NXBIN/libcopilot* 库，原版页面无法从它重建。', true);
+    }
+  }
   async function loadSettings(force = false) {
     const result = requireOK(await api('/api/settings'));
     state.settings = result;
     text('active-model', result.active.label + ' · ' + result.active.model);
     text('model-chip', result.active.model || '未设置模型'); $('model-chip').title = result.active.label;
     text('footer-workspace', result.nx.nxWorkspace || '工作区未配置'); $('footer-workspace').title = result.nx.nxWorkspace || '';
+    applyDetectedNx(result.nx);
     if (!state.dirty || force) {
       state.drafts.clear();
       $('provider').replaceChildren(...result.providers.map(p => { const option = node('option', '', p.label); option.value = p.id; return option; }));

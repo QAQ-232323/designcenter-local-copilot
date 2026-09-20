@@ -10,6 +10,7 @@ from nx_skill.config import Settings
 from nx_skill.discovery import (
     NxNotFound,
     detect_capabilities,
+    detect_copilot,
     detect_release,
     discover,
     find_all,
@@ -152,3 +153,74 @@ def test_install_reports_derived_paths(tmp_path):
     assert payload["apiXmlDocCount"] == 1
     assert Path(payload["pythonStubs"]).is_dir()
     assert Path(payload["examples"]).is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Built-in Copilot: identified by what is on disk, never by release number, so
+# any release that ships the feature is recognised (2606 / 2506 / 2406 / 2306).
+# ---------------------------------------------------------------------------
+
+
+def _add_copilot_page(root: Path) -> Path:
+    plchat = root / "UGII" / "copilot" / "plchat"
+    plchat.mkdir(parents=True, exist_ok=True)
+    page = plchat / "PLChat.html"
+    page.write_text("<html></html>", encoding="utf-8")
+    (plchat / "plchat.js").write_text("//\n", encoding="utf-8")
+    return page
+
+
+def _add_copilot_libs(root: Path, *names: str) -> None:
+    nxbin = root / "NXBIN"
+    nxbin.mkdir(parents=True, exist_ok=True)
+    for name in (names or ("libcopilot.dll", "libcopilotui.dll")):
+        (nxbin / name).write_bytes(b"MZ")
+
+
+@pytest.mark.parametrize("release_dir", ["DC 2606", "NX 2506", "NX 2406", "NX 2306", "NX 1996"])
+def test_copilot_is_detected_in_any_release_that_ships_it(tmp_path, release_dir):
+    root = build_fake_nx(tmp_path / release_dir)
+    _add_copilot_page(root)
+    _add_copilot_libs(root)
+
+    probe = detect_copilot(root)
+    assert probe.available
+    assert probe.page_available
+    assert probe.page == root / "UGII" / "copilot" / "plchat" / "PLChat.html"
+    assert probe.scripts_dir == root / "UGII" / "copilot" / "plchat"
+    assert len(probe.libraries) == 2
+    assert probe.markers == ("page", "plchat_dir", "copilot_dir", "ai_libs")
+    # capabilities 也要带上,这样 nx-skill doctor 与 nx_status 都能看到
+    assert "copilot" in detect_capabilities(root)
+
+
+def test_plain_nx_install_has_no_copilot(tmp_path):
+    root = build_fake_nx(tmp_path / "NX 2512")
+    probe = detect_copilot(root)
+    assert not probe.available
+    assert probe.markers == ()
+    assert probe.page is None
+    assert "copilot" not in detect_capabilities(root)
+
+
+def test_copilot_engine_without_the_page_is_reported_honestly(tmp_path):
+    """Only the libraries are present: there is AI, but nothing to host locally."""
+    root = build_fake_nx(tmp_path / "DC 2606")
+    _add_copilot_libs(root, "libcopilot.dll")
+
+    probe = detect_copilot(root)
+    assert probe.available
+    assert not probe.page_available
+    assert probe.markers == ("ai_libs",)
+
+
+def test_install_to_dict_carries_the_copilot_block(tmp_path):
+    root = build_fake_nx(tmp_path / "DC 2606")
+    _add_copilot_page(root)
+    _add_copilot_libs(root)
+    settings = Settings(workspace=tmp_path / "ws", skip_global_search=True)
+    payload = discover(requested=root, settings=settings).to_dict()
+    assert payload["copilot"]["available"] is True
+    assert payload["copilot"]["pageAvailable"] is True
+    assert payload["copilot"]["libraries"]
+    assert "copilot" in payload["capabilities"]

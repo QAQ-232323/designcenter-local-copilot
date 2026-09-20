@@ -14,6 +14,7 @@ const fs = require("fs");
 const path = require("path");
 const url = require("url");
 const { spawn } = require("child_process");
+const nxdetect = require("./nxdetect");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8765);
@@ -38,7 +39,7 @@ const DEFAULT_SYS = "你是 Siemens Designcenter / NX 的 CAD 助手,用简体�
   "当用户要一份建模计划时,用 nx_route_intent + nx_modeling_plan 产出分阶段计划,不要只有一步。" +
   "当用户明确表示要把它拿到 NX 里执行时,调用 nx_review_submit 提交计划:步骤名用 NN_Short_Action_Object 编号;" +
   "CAE 求解、保存、导出、布尔、删除、批量改特征这类破坏性步骤一律 gate=manual,参考几何/草图/基本体可用 gate=auto。" +
-  "当计划需要 journal 步骤时,你必须自己写出完整的 NXOpen Python 脚本放进 script 字段:脚本必须包含 def main(): ... 以及 if __name__ == '__main__': main() 的入口(执行器用 runpy 以 __main__ 运行它);不要用 f-string(内嵌解释器可能是 Python 2.7),不要依赖第三方库,只 import NXOpen / NXOpen.xxx;操作当前工作零件(session.Parts.Work),不要调用 Save/Export(那是单独的 manual 步骤);不要自己调用 SetUndoMark / UndoToMark(执行器已为每步建撤销标记);每个提交的对象按 NN_Short_Action_Object 命名,让部件导航器读起来是有序历史;写之前先用 nx_docs_search / nx_docs_member 核对 API 名称与签名,不要凭记忆写;params.path 用形如 02_FLANGE_Bolt_Holes.py 的文件名并与步骤名对应;脚本要短小、单步可诊断。" +
+  "当计划需要 journal 步骤时,你必须自己写出完整的 NXOpen Python 脚本放进 script 字段:脚本必须包含 def main(): ... 以及 if __name__ == '__main__': main() 的入口(执行器用 runpy 以 __main__ 运行它);不要用 f-string(内嵌解释器可能是 Python 2.7),不要依赖第三方库,导入要写全:import NXOpen 不会带出子模块,用到 NXOpen.Features.X / NXOpen.GeometricUtilities.X 就必须显式 import NXOpen.Features / import NXOpen.GeometricUtilities(漏了它,NX 只会说'无法执行 python 脚本');操作当前工作零件(session.Parts.Work),不要调用 Save/Export(那是单独的 manual 步骤);不要自己调用 SetUndoMark / UndoToMark(执行器已为每步建撤销标记);每个提交的对象按 NN_Short_Action_Object 命名,让部件导航器读起来是有序历史;写之前先用 nx_docs_search / nx_docs_member 核对 API 名称与签名,不要凭记忆写;params.path 用形如 02_FLANGE_Bolt_Holes.py 的文件名并与步骤名对应;脚本要短小、单步可诊断。" +
   "提交后告诉用户去 Designcenter 里点 NX Skill → Review Plan 逐步执行。绝对不要声称你已经执行或已经改动模型。";
 
 function loadRaw() {
@@ -61,7 +62,7 @@ function loadConfig() {
     cleanupOnNxExit: ["all", "scratch", "smart", "off"].includes(raw.cleanupOnNxExit) ? raw.cleanupOnNxExit : "all",
     colorTheme: raw.colorTheme || "light",
     locale: raw.locale || "en_US",
-    version: raw.version || "2606.1700"
+    version: raw.version || ""            // 空 = 用检测到的 release(不再写死 2606.1700)
   };
   // 旧版:顶层 provider/baseUrl/apiKey/model
   if (!Object.keys(cfg.providers).length && (raw.baseUrl || raw.provider)) {
@@ -94,6 +95,52 @@ function active(cfg) {
     apiKey: p.apiKey || "",
     model: p.model || preset.model || ""
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * 本机安装识别 —— 不写死版本号
+ * 内置 Copilot 不由版本号决定,而由"这个安装里有没有那套页面和 AI 库"决定,
+ * 所以这里按结构特征找安装、判断能力:2606 / 2506 / 2406 / 2306 一视同仁。
+ * 实现见 nxdetect.js(零依赖);结果缓存 60s,避免每个请求都扫盘。
+ * ------------------------------------------------------------------ */
+let NX_INFO = { at: 0, want: null, versions: false, data: null };
+function nxInstall(cfg, force, withVersions) {
+  const want = (cfg && cfg.nxRoot) || "";
+  const versions = !!withVersions;
+  const fresh = NX_INFO.data && (Date.now() - NX_INFO.at) < 60000 &&
+    NX_INFO.want === want && NX_INFO.versions === versions;
+  if (fresh && !force) return NX_INFO.data;
+  const opts = { versions };
+  const all = nxdetect.detectAll(opts);
+  const active = nxdetect.pick(want, opts);
+  NX_INFO = { at: Date.now(), want, versions, data: { active, all } };
+  return NX_INFO.data;
+}
+/** 给界面/页面用的精简结构 */
+function nxInfo(cfg, force, withVersions) {
+  const { active, all } = nxInstall(cfg, force, withVersions);
+  return {
+    active: active ? {
+      root: active.root, release: active.release, version: active.version || "",
+      product: active.product || "", source: active.source,
+      hasCopilot: active.hasCopilot, ugraf: active.ugraf,
+      copilot: {
+        page: active.copilot.page, scriptsDir: active.copilot.scriptsDir,
+        libs: active.copilot.libs, markers: active.copilot.markers
+      }
+    } : null,
+    installations: all.map(p => ({
+      root: p.root, release: p.release, product: p.product || "", source: p.source,
+      hasCopilot: p.hasCopilot, page: p.copilot.page, libCount: p.copilot.libs.length
+    }))
+  };
+}
+/** plservice-version:配置优先,其次检测到的精确版本(2606.1700),再其次 release,都没有就 unknown */
+function pageVersion(cfg) {
+  if (cfg && cfg.version) return cfg.version;
+  const info = nxInfo(cfg, false, true);      // 只有这条路需要翻卸载登记表拿精确版本
+  const a = info.active;
+  return (a && (a.version || a.release)) || "unknown";
 }
 
 /* ------------------------------------------------------------------ *
@@ -163,6 +210,28 @@ function buildDriver(plan, cfg) {
   return { src, part, report, scriptCount: steps.length };
 }
 
+/** live 桥失败时,NX 只说"无法执行 python 脚本,请参见系统日志",信息量为零。
+ *  nx-skill 的 payload 会把真正的 traceback 写到 <workspace>/generated/<脚本>.error.txt
+ *  (见 nx_runtime/application/nx_run_python_payload.py),这里把它捞出来:
+ *  返回最后一行异常 + 出错位置,完整内容仍在那个文件里。 */
+function liveErrorDetail(cfg, sinceMs) {
+  const dir = path.join(cfg.nxWorkspace || "", "generated");
+  try {
+    const newest = fs.readdirSync(dir)
+      .filter(f => /\.error\.txt$/i.test(f))
+      .map(f => ({ p: path.join(dir, f), t: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .filter(x => !sinceMs || x.t >= sinceMs - 2000)
+      .sort((a, b) => b.t - a.t)[0];
+    if (!newest) return "";
+    const text = fs.readFileSync(newest.p, "utf8");
+    const lines = text.trim().split(/\r?\n/).filter(Boolean);
+    const last = lines[lines.length - 1] || "";
+    const where = (text.match(/File "[^"]+", line \d+/g) || []).pop() || "";
+    const short = where.replace(/^File "([^"]+)", line (\d+)$/, "$1:$2").replace(/^.*[\\/]/, "");
+    return short ? (last + "  (" + short + ")") : last;
+  } catch (e) { return ""; }
+}
+
 /** 在当前打开的 NX 会话里执行计划(走 live 桥,作用于当前工作零件) */
 async function runPlanLive(cfg) {
   const ws = cfg.nxWorkspace || "";
@@ -172,6 +241,7 @@ async function runPlanLive(cfg) {
 
   const steps = (plan.steps || []).filter(s => s.operation === "journal");
   if (!steps.length) return { ok: false, error: "这份计划没有可执行的 journal 步骤" };
+  const runStarted = Date.now();
 
   progressStart("run", "在当前 NX 会话执行 " + (plan.planId || ""));
   progressStage("ping", "检查 live 桥…");
@@ -190,8 +260,14 @@ async function runPlanLive(cfg) {
     progressStage("running", "在当前会话执行 " + s.name + " …");
     const r = await runNxSkill(cfg, ["live", "python", "--stage", s.name], cfg.toolTimeoutMs, src);
     const ok = !!(r.envelope && r.envelope.ok);
-    out.push({ id: s.id, name: s.name, script: base, status: ok ? "done" : "failed", ms: r.ms,
-               message: ok ? "" : ((r.envelope && r.envelope.error && (r.envelope.error.message || r.envelope.error.error)) || r.stderr || "") });
+    let message = ok ? "" : ((r.envelope && r.envelope.error && (r.envelope.error.message || r.envelope.error.error)) || r.stderr || "");
+    if (!ok) {
+      // NX 对脚本报错只会说"无法执行 python 脚本,请参见系统日志"——把 nx-skill payload
+      // 落下的真实 traceback 捞出来,否则用户拿到一句没法用的提示。
+      const detail = liveErrorDetail(cfg, runStarted);
+      if (detail) message = message.replace(/\s*$/, "") + "  真实原因: " + detail;
+    }
+    out.push({ id: s.id, name: s.name, script: base, status: ok ? "done" : "failed", ms: r.ms, message });
     console.log("[run-live] " + s.name + " -> " + (ok ? "done" : "failed") + " (" + r.ms + "ms)");
     if (!ok) break;
   }
@@ -558,8 +634,50 @@ function checkNxOpenNames(script) {
   return { ok: unknown.length === 0, unknown };
 }
 
-/** 用宿主 Python 对 journal 脚本做语法检查(只编译,不执行) */
-function checkPythonSyntax(file) {
+/** 在 live 解释器里**本来就可用**的 NXOpen 基础模块 —— 只写 import NXOpen 就有它们。
+ *  实测(2606,live 桥,干净解释器):Session / BaseSession / UI 在;其余都不在。
+ *  这个白名单是量出来的,不是猜的:漏掉会误报,多列会放过真错误。 */
+const NXOPEN_AUTOLOADED = new Set(["Session", "BaseSession", "UI"]);
+
+/** 返回脚本里用到、却没有 import 的 NXOpen 子模块。
+ *
+ *  为什么必须拦这一条(2026-09-20 实测踩到):
+ *  `import NXOpen` **不会**带出 `NXOpen.Features` / `NXOpen.GeometricUtilities` 这类子模块。
+ *  journal(批处理)路径下 NX 会把子模块预加载好,所以"headless 实跑通过"的样例能过;
+ *  而 live 桥是在 NX 进程里用 runpy 跑一个干净解释器,少一行 import 就是
+ *  `AttributeError: module 'NXOpen' has no attribute 'Features'` ——
+ *  偏偏 NX 对外只说"无法执行 python 脚本,请参见系统日志",现场几乎无法定位。
+ *  所以这条在提交时静态查出来,直接退回给模型重写。
+ */
+function checkNxOpenImports(script) {
+  const code = stripNonCode(script);
+  const modules = new Set();          // 已 import 的二级模块名,如 Features、GeometricUtilities
+  let m;
+  const ire = /^[ \t]*(?:import|from)[ \t]+(NXOpen(?:\.[A-Za-z_][A-Za-z0-9_]*)*)/gm;
+  while ((m = ire.exec(code)) !== null) {
+    const parts = m[1].split(".");
+    if (parts.length >= 2) modules.add(parts[1]);
+  }
+  // from NXOpen import Features, Session
+  const fre = /^[ \t]*from[ \t]+NXOpen[ \t]+import[ \t]+([^\n#]+)/gm;
+  while ((m = fre.exec(code)) !== null) {
+    m[1].split(",").forEach(part => {
+      const name = part.trim().split(/[\s.]+/)[0];
+      if (name) modules.add(name);
+    });
+  }
+  const missing = new Set();
+  const ure = /NXOpen(?:\.[A-Za-z_][A-Za-z0-9_]*)+/g;
+  while ((m = ure.exec(code)) !== null) {
+    const parts = m[0].split(".");
+    if (parts.length < 3) continue;                       // NXOpen.Point3d / NXOpen.Vector3d:根模块就够
+    if (NXOPEN_AUTOLOADED.has(parts[1])) continue;         // 基础模块本来就可用
+    if (!modules.has(parts[1])) missing.add("NXOpen." + parts[1]);
+  }
+  return { ok: missing.size === 0, missing: Array.from(missing) };
+}
+
+/** 用宿主 Python 对 journal 脚本做语法检查(只编译,不执行) */function checkPythonSyntax(file) {
   const { spawnSync } = require("child_process");
   const r = spawnSync("python", ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", file],
     { encoding: "utf8", windowsHide: true });
@@ -576,10 +694,15 @@ const TOOLS = {
     compact: (e) => {
       const r = (e && e.result) || {}, s = r.settings || {};
       return {
-        detectedInstallations: (r.installations || []).map(i => ({ root: i.root, release: i.release, nxbin: i.nxbin, apiXmlDocCount: i.apiXmlDocCount, capabilities: i.capabilities })),
+        detectedInstallations: (r.installations || []).map(i => ({
+          root: i.root, release: i.release, nxbin: i.nxbin, apiXmlDocCount: i.apiXmlDocCount,
+          capabilities: i.capabilities,
+          // 内置 Copilot 是"这一版有没有"决定的,按结构特征识别,与版本号无关
+          copilot: i.copilot || null
+        })),
         workspace: s.workspace, livePort: s.livePort,
         runningNxGuiProcesses: r.nxGuiProcesses || [], problems: r.problems || [],
-        note: "detectedInstallations 才是本机真实存在的 NX 安装"
+        note: "detectedInstallations 才是本机真实存在的 NX 安装;copilot.available 表示该安装带内置 Copilot 功能"
       };
     }
   },
@@ -681,6 +804,17 @@ TOOLS.nx_review_submit = {
         throw new Error("步骤 " + steps[i].name + " 的脚本 " + base + " 里用了不存在的 NXOpen API:" +
           api.unknown.map(u => "\n  - " + u.token + (u.suggest.length ? "   可能是: " + u.suggest.join(" / ") : "")).join("") +
           "\n请直接用上面给出的名字改掉,然后重新提交;不要再反复搜索 API。");
+      }
+      // 子模块 import 门禁:import NXOpen 不会带出 NXOpen.Features 这类子模块,
+      // journal 环境会预加载、live 桥不会 —— 少一行 import 就是"无法执行 python 脚本"。
+      const imp = checkNxOpenImports(String(s.script));
+      if (!imp.ok) {
+        throw new Error("步骤 " + steps[i].name + " 的脚本 " + base + " 用了这些 NXOpen 子模块但没有 import:" +
+          imp.missing.map(x => "\n  - " + x).join("") +
+          "\n请注意:import NXOpen **不会**带出子模块,脚本开头必须显式写 import NXOpen.<模块>。" +
+          "例如用到 NXOpen.Features.CylinderBuilder 就先写 import NXOpen.Features;" +
+          "用到 NXOpen.GeometricUtilities.BooleanOperation 就先写 import NXOpen.GeometricUtilities。" +
+          "请在脚本开头补上对应的 import 后重新提交。");
       }
       args.push("--script", f);
     }
@@ -1029,12 +1163,16 @@ async function answerInner(question, cfg, a, trace) {
  * ------------------------------------------------------------------ */
 /** 给模型的"示范":一份已通过语法与 API 名双重校验的完整计划样例 */
 /** 给模型的"示范":一份**在 headless NX 里实际跑通过**的计划样例。
- * 三条实机验证出来的坑(文档与静态检查都看不出来):
+ * 四条实机验证出来的坑(文档与静态检查都看不出来):
  *   Origin     必须是 NXOpen.Point3d —— 传 Point 对象或 Vector3d 都报 "Expecting NXOpen.Point3d"
  *   Direction  必须是 NXOpen.Vector3d —— 传 CreateDirection 返回的 Direction 对象报 "Expecting NXOpen.Vector3d"
  *   布尔目标   用 BooleanOption.SetTargetBodies(list(...)) 这个方法;没有 TargetBodies 属性
+ *   子模块     import NXOpen **不会**带出 NXOpen.Features / NXOpen.GeometricUtilities 这类子模块。
+ *              journal 环境会预加载所以 headless 能跑,live 桥(干净解释器 + runpy)不行 ——
+ *              用到哪个子模块就必须 import 哪个,否则就是 "无法执行 python 脚本,请参见系统日志"
+ *              背后藏着的 AttributeError(2026-09-20 实测)。
  */
-const EXAMPLE_RECIPE = ["import math", "import NXOpen", "", "", "def cylinder(part, x, y, z, dia, h, create):", "    b = part.Features.CreateCylinderBuilder(None)", "    b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "    b.Origin = NXOpen.Point3d(x, y, z)", "    b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "    b.Diameter.RightHandSide = str(dia)", "    b.Height.RightHandSide = str(h)", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    b.BooleanOption.Type = C.Create if create else C.Subtract", "    if not create:", "        bodies = list(part.Bodies)", "        if bodies:", "            b.BooleanOption.SetTargetBodies(bodies)", "    f = b.Commit()", "    b.Destroy()", "    return f", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    if part is None:", "        raise RuntimeError('no work part')", "    f = cylinder(part, 0.0, 0.0, 0.0, 200, 20, True)", "    f.SetName('01_Flange_Disc')", "", "", "if __name__ == '__main__':", "    main()"].join("\n");
+const EXAMPLE_RECIPE = ["import math", "import NXOpen", "import NXOpen.Features", "import NXOpen.GeometricUtilities", "", "", "def cylinder(part, x, y, z, dia, h, create):", "    b = part.Features.CreateCylinderBuilder(None)", "    b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "    b.Origin = NXOpen.Point3d(x, y, z)", "    b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "    b.Diameter.RightHandSide = str(dia)", "    b.Height.RightHandSide = str(h)", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    b.BooleanOption.Type = C.Create if create else C.Subtract", "    if not create:", "        bodies = list(part.Bodies)", "        if bodies:", "            b.BooleanOption.SetTargetBodies(bodies)", "    f = b.Commit()", "    b.Destroy()", "    return f", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    if part is None:", "        raise RuntimeError('no work part')", "    f = cylinder(part, 0.0, 0.0, 0.0, 200, 20, True)", "    f.SetName('01_Flange_Disc')", "", "", "if __name__ == '__main__':", "    main()"].join("\n");
 const EXAMPLE_PLAN = JSON.stringify({
   prompt: "在法兰盘上做中心通孔和 6 个螺栓孔",
   partPath: "",
@@ -1043,7 +1181,7 @@ const EXAMPLE_PLAN = JSON.stringify({
       params: { path: "01_Create_Flange_Disc.py" }, note: "法兰盘体 OD200 H20", script: EXAMPLE_RECIPE },
     { name: "02_Bolt_Holes_Six", operation: "journal", gate: "manual",
       params: { path: "02_Bolt_Holes_Six.py" }, note: "O160 分度圆上 6xO16 螺栓孔(布尔求差)",
-      script: ["import math", "import NXOpen", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    for i in range(6):", "        a = 2.0 * math.pi * i / 6.0", "        b = part.Features.CreateCylinderBuilder(None)", "        b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "        b.Origin = NXOpen.Point3d(80.0 * math.cos(a), 80.0 * math.sin(a), -5.0)", "        b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "        b.Diameter.RightHandSide = '16'", "        b.Height.RightHandSide = '30'", "        b.BooleanOption.Type = C.Subtract", "        bodies = list(part.Bodies)", "        if bodies:", "            b.BooleanOption.SetTargetBodies(bodies)", "        f = b.Commit()", "        f.SetName('02_Bolt_Hole_%02d' % (i + 1))", "        b.Destroy()", "", "", "if __name__ == '__main__':", "    main()"].join("\n") },
+      script: ["import math", "import NXOpen", "import NXOpen.Features", "import NXOpen.GeometricUtilities", "", "", "def main():", "    session = NXOpen.Session.GetSession()", "    part = session.Parts.Work", "    C = NXOpen.GeometricUtilities.BooleanOperation.BooleanType", "    for i in range(6):", "        a = 2.0 * math.pi * i / 6.0", "        b = part.Features.CreateCylinderBuilder(None)", "        b.Type = NXOpen.Features.CylinderBuilder.Types.AxisDiameterAndHeight", "        b.Origin = NXOpen.Point3d(80.0 * math.cos(a), 80.0 * math.sin(a), -5.0)", "        b.Direction = NXOpen.Vector3d(0.0, 0.0, 1.0)", "        b.Diameter.RightHandSide = '16'", "        b.Height.RightHandSide = '30'", "        b.BooleanOption.Type = C.Subtract", "        bodies = list(part.Bodies)", "        if bodies:", "            b.BooleanOption.SetTargetBodies(bodies)", "        f = b.Commit()", "        f.SetName('02_Bolt_Hole_%02d' % (i + 1))", "        b.Destroy()", "", "", "if __name__ == '__main__':", "    main()"].join("\n") },
     { name: "03_Review_Screenshot", operation: "screenshot", gate: "manual", params: {}, note: "人工检查" }
   ]
 }, null, 1);
@@ -1066,7 +1204,8 @@ async function authorPlan(cfg, question, partName) {
     "规则:",
     "1. 步骤名必须是 NN_Short_Action_Object(两位编号);步骤要覆盖用户要求的每个特征,不要只给一步。",
     "2. 需要几何操作用 operation=journal,并在 script 里给出完整可运行的 NXOpen Python 源码;params.path 用与步骤名一致的 .py 文件名。",
-    "3. 脚本必须含 def main(): 与 if __name__ == '__main__': main();不要用 f-string;只 import NXOpen/NXOpen.xxx;操作 session.Parts.Work;不要 Save/Export;不要自己调 SetUndoMark/UndoToMark。",
+    "3. 脚本必须含 def main(): 与 if __name__ == '__main__': main();不要用 f-string;操作 session.Parts.Work;不要 Save/Export;不要自己调 SetUndoMark/UndoToMark。",
+    "3b. 【必须】用的子模块要在脚本开头逐个 import:import NXOpen **不会**带出 NXOpen.Features / NXOpen.GeometricUtilities 这类子模块。用到 NXOpen.Features.CylinderBuilder 就先写 import NXOpen.Features;用到 NXOpen.GeometricUtilities.BooleanOperation 就先写 import NXOpen.GeometricUtilities。少一行 import,NX 只会报'无法执行 python 脚本',系统会拦下并告诉你缺哪个。",
     "4. 破坏性步骤(切除、布尔、保存、导出、求解)用 gate=manual;基础体/参考几何可用 gate=auto。",
     "5. 最后一步建议 operation=screenshot、gate=manual,供人工检查。",
     "6. 脚本里用到的 NXOpen 名字必须是真实存在的;系统会逐个校验,错了会把正确拼写告诉你。",
@@ -1203,7 +1342,14 @@ const server = http.createServer(async (req, res) => {
                  baseUrl: cur.baseUrl || p.baseUrl || "", model: cur.model || p.model || "", hasKey: !!cur.apiKey, apiKeyMasked: mask(cur.apiKey) };
       }),
       systemPrompt: cfg.systemPrompt,
-      nx: { nxSkillRoot: cfg.nxSkillRoot, nxRoot: cfg.nxRoot, nxWorkspace: cfg.nxWorkspace, maxToolRounds: cfg.maxToolRounds, toolTimeoutMs: cfg.toolTimeoutMs },
+      nx: {
+        nxSkillRoot: cfg.nxSkillRoot, nxRoot: cfg.nxRoot, nxWorkspace: cfg.nxWorkspace,
+        maxToolRounds: cfg.maxToolRounds, toolTimeoutMs: cfg.toolTimeoutMs,
+        // 本机装了什么、哪个版本带内置 Copilot —— 由 nxdetect 扫出来,不写死版本号。
+        // 这里走快路径(不翻卸载登记表),首屏才不会被那 2~3 秒拖住;
+        // 精确版本(2606.1700 这种)只在原版页面加载 /local-config.js 时才算,见 /api/nxenv。
+        detected: nxInfo(cfg)
+      },
       tools: Object.keys(TOOLS)
     });
     return;
@@ -1278,6 +1424,33 @@ const server = http.createServer(async (req, res) => {
   /* ---- 连通性自检(NX 面板里也能打开这个地址看) ---- */
   if (parsed.pathname === "/api/ping") {
     sendJson(res, { ok: true, time: new Date().toLocaleString("zh-CN"), provider: active(loadConfig()).label, tools: Object.keys(TOOLS).length });
+    return;
+  }
+
+  /* ---- 本机安装识别:列出所有 Designcenter/NX 安装,标注哪些版本带内置 Copilot ---- */
+  if (parsed.pathname === "/api/nxenv") {
+    const info = nxInfo(loadConfig(), true, true);   // 显式请求:绕过缓存 + 取精确版本
+    sendJson(res, {
+      ok: true,
+      active: info.active,
+      installations: info.installations,
+      note: "hasCopilot = 该安装里同时检出了页面/Copilot 资源目录与 NXBIN/libcopilot* 库"
+    });
+    return;
+  }
+
+  /* ---- 给原版页面(legacy.html)注入版本等运行时配置,替代写死的 2606.1700 ---- */
+  if (parsed.pathname === "/local-config.js") {
+    const cfg = loadConfig();
+    const info = nxInfo(cfg);
+    res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" });
+    res.end("window.__PLCHAT_LOCAL_CONFIG__ = " + JSON.stringify({
+      version: pageVersion(cfg),
+      release: (info.active && info.active.release) || "",
+      product: "NX_X",
+      backendUrl: "/api/ask",
+      hasCopilot: !!(info.active && info.active.hasCopilot)
+    }) + ";\n");
     return;
   }
   if (parsed.pathname === "/api/log") {
@@ -1425,7 +1598,8 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         indexSize: idx.size,
         syntax: (() => { const fsx = require("fs"), osx = require("os"); const f = path.join(osx.tmpdir(), "precheck_" + Date.now() + ".py"); fsx.writeFileSync(f, src, "utf8"); const r = require("child_process").spawnSync("python", ["-c", "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", f], { encoding: "utf8", windowsHide: true }); try { fsx.unlinkSync(f); } catch (e) { } return r.status === 0 ? { ok: true } : { ok: false, error: ((r.stderr || "") + (r.stdout || "")).trim().split("\n").slice(-5).join("\n") }; })(),
-        api: checkNxOpenNames(src)
+        api: checkNxOpenNames(src),
+        imports: checkNxOpenImports(src)
       });
     });
     return;

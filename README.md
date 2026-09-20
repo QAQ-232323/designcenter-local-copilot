@@ -42,6 +42,10 @@ node server.js 8765                    # 或双击 start.cmd
 
 ## 1. 先说结论
 
+> **版本无关**:这一节是 2606 上的实机发现记录。识别安装、判断"这一版有没有内置 Copilot"、
+> 从前端重建页面,全部按**结构特征**做,不认版本号 —— 2506 / 2406 / 2306 只要装了这套文件
+> 一样适用,见第 20 节。
+
 * 你装的 **Siemens Designcenter 2606**(\`D:\\Program Files\\Siemens\\DC 2606\`)里**确实内置了 AI**,产品名叫 **Designcenter Copilot**。
 * 内置页面本体就在你的硬盘上:
 
@@ -698,6 +702,112 @@ server + client。做完重启 Designcenter,再点一次 Start NX Skill Live Bri
 
 > 已用 `-ClientOnly` 单独编译验证过:补丁本身**编译通过**,原先的失败是
 > `error CS0016 无法写入输出文件…另一个进程正在使用` —— 纯粹是文件锁,不是语法错。
+
+## 19. 让宿主跟着 Designcenter 自动启动(本机已配置)
+
+不想每次手点 `start.cmd`:`plchat-local/dc/autostart-on.cmd` 装一个**登录时启动的看护脚本**
+(`dc/host_watchdog.vbs`)——每 3 秒做两件事:用 `/api/ping` 看宿主在不在;不在、且 `ugraf.exe`
+在跑,就隐藏拉起 `node server.js 8765`。`autostart-off.cmd` 撤除,**不需要管理员**。
+
+* `ugraf.exe` 是**所有** Designcenter / NX 版本的主程序名(2606 / 2506 / 2406 / 2306 …),
+  所以这个门控与版本号无关。
+* 实测(2026-09-20):无 `ugraf.exe` 时杀掉宿主,12 秒内没有被拉起;用一个顶替 `ugraf.exe`
+  名字的进程模拟 DC 后,宿主 12 秒内被自动拉起。宿主被杀只要 DC 还开着就会自愈。
+
+> ⚠ **这条脚本被火绒误报删除过一次**(`TrojanDownloader/VBS.Agent.dd`,2026-09-20 14:22,
+> 误报点:"枚举进程 + 隐藏启动程序 + HTTP 请求")。现在能用是因为防护关掉了/放行了。
+> 换杀软或重开防护后如果文件被删,症状是"DC 起来但宿主不自动起":要么在安全软件里放行
+> `host_watchdog.vbs`,要么退回无脚本的 `HKCU\...\Run` 方案(代价:失去 DC 门控)。
+> **不要混淆脚本去绕检测。**
+
+**为什么不是计划任务**:计划任务(登录触发 + 每分钟重复 + `IgnoreNew`)本来更干净,但
+**创建计划任务需要管理员** —— 非提升权限下 `schtasks /Create` 直接 `错误: 拒绝访问。`。
+愿意用管理员装一次的话,那是更好的方案。
+
+细节、开关、排障见 [`plchat-local/dc/如何让宿主自动启动.md`](plchat-local/dc/如何让宿主自动启动.md)。
+
+---
+
+## 20. 通用版本识别(2606 / 2506 / 2406 / 2306 …)
+
+**内置 Copilot 不由版本号决定,由"这一版安装里有没有那套文件"决定。** 所以仓库里凡是需要
+"知道是哪个版本 / 有没有 AI"的地方,一律按**结构特征**判断,不写死 release:
+
+| 标记 | 含义 |
+|---|---|
+| `UGII/copilot/plchat/PLChat.html` | 内置 Copilot 页面本体(最强特征;`fetch-frontend.sh` 就是从它的目录重建前端) |
+| `UGII/copilot/plchat/` `UGII/copilot/` | 页面脚本目录 / Copilot 资源根 |
+| `NXBIN/libcopilot*` | AI 内核库(2606 实测 4 个:`libcopilot` / `libcopilotui` / `libcopilotinit` / `libcopilotuiinit`;按通配匹配,不同版本命名不同) |
+
+版本号(release 与精确版本)取自注册表,不写死:键名 `HKLM\SOFTWARE\Siemens\Designcenter 2606`
+→ release `2606`;卸载登记项 `InstallSource=…\DC2606.1700\…` → 精确版本 `2606.1700`
+(页面的 `plservice-version` 用的就是它,本项目原先写死的正是这个值)。
+
+落地在三处(各自零依赖,同一套标记规则):
+
+| 位置 | 作用 |
+|---|---|
+| `plchat-local/nxdetect.js` | 宿主侧识别:枚举注册表 + 各盘 `Program Files\Siemens\*` + 环境变量,给出每个安装的 release / 精确版本 / 有没有 Copilot。**只认结构,不认版本号** |
+| `plchat-local/server.js` | `GET /api/nxenv` 列出全部安装与能力;`/api/settings` 的 `nx.detected` 给界面;`/local-config.js` 把识别出的版本注入原版页面(替代写死的 `2606.1700`) |
+| 工作台顶部徽标 | 显示 `NX / <检测到的版本>`,没有 Copilot 时标 `· 无 Copilot`(悬停可看安装目录、命中标记、页面路径、AI 库数量) |
+| `nx-skill` `discovery.py` | `detect_copilot()` + `capabilities` 里的 `copilot`,所以 `nx-skill doctor` 与模型的 `nx_status` 也能看到 |
+| `fetch-frontend.sh` | 找安装时要求 `UGII/copilot/plchat` 存在;**页面脚本改成"安装里有哪些 .js 就拷哪些"**(旧版本文件名可能不同);多版本共存时**取版本号最高的** |
+
+已验证(本机):识别出 `D:\Program Files\Siemens\DC 2606`,release `2606`,精确版本 `2606.1700`
+(与原先写死的值一致,说明通用路径能复现原行为),`capabilities` 含 `copilot`,4 个 AI 库,
+页面路径正确;nx-skill 侧新增 8 个测试全绿。
+
+**诚实的边界**:页面脚本与宿主桥协议只在 **2606** 上实测过。其它版本(2506/2406/2306)目前是
+**识别得到、但没有真机验证过**——真装上了如果文件名/协议有差异,`fetch-frontend.sh` 会按实际
+文件拷贝并报告缺件,`WARN` 提示需要人工确认。
+
+## 21. 脚本报"无法执行 python 脚本"时到底错在哪
+
+真实案例(2026-09-20):工作台点"在当前 NX 会话执行",第一步就报
+
+```
+失败 · 01_Create_Flange_Disc 无法执行 python 脚本。有关更多详细信息，请参见系统日志。
+```
+
+这句是 **NX 自己的泛化提示**,它把真正的原因(NX 系统日志)藏起来了。而真因是:
+
+```
+AttributeError: module 'NXOpen' has no attribute 'Features'
+```
+
+**根因:`import NXOpen` 不会带出子模块。** `NXOpen.Features` / `NXOpen.GeometricUtilities`
+这类子模块必须显式 `import NXOpen.Features`。三条实测结论:
+
+| | |
+|---|---|
+| journal(批处理 `run_journal`) | NX 会**预加载**子模块 → 只写 `import NXOpen` 也能跑 |
+| live 桥(`runpy`,NX 进程内干净解释器) | **不预加载** → 少一行 import 就是 AttributeError |
+| 本来就自带的 | 实测只有 `Session` / `BaseSession` / `UI`(白名单是量出来的,不是猜的) |
+
+更阴的一点:**同一个 NX 会话里,只要之前有脚本 import 过某个子模块,它就留在
+`sys.modules` 里,后续脚本"侥幸"都能用** —— 所以这个错只在**干净会话第一次**出现,
+重启 NX 之后又复现,"明明刚才还能跑"就是这么来的。
+
+### 两个改动(都已落地)
+
+1. **提交时静态门禁**(`server.js` 的 `checkNxOpenImports`):脚本用到 `NXOpen.X.Y` 却没
+   `import NXOpen.X` 就直接拒绝提交,并把该补的 import 明确回给模型重写。模型照着修一次就好,
+   不会再走到 NX 里才炸。顺带把生成样例(`EXAMPLE_RECIPE`)和提示词都补上了 import ——
+   样例缺 import 是这次事故的直接来源。
+2. **把真实原因带出来**:nx-skill 的 in-NX payload 在脚本抛异常时,会把完整 traceback 写到
+   `<工作区>/generated/<脚本>.error.txt` 和信息窗口(Listing Window),然后**照常抛**(执行状态
+   仍是失败,不会被吞成成功);宿主的 live 执行再把最后一行异常与出错位置读出来附在结果里:
+
+```
+失败 · 01_Diag_Expect_Failure 无法执行 python 脚本。…请参见系统日志。
+  真实原因: RuntimeError: …  (inline_01_Diag_Expect_Failure.py:7)
+```
+
+对应地,**队列里那三个脚本已经补上 `import NXOpen.Features` / `NXOpen.GeometricUtilities`**
+(它们都是同一个病),并且步骤 01 已经在当前会话执行成功(零件里已生成 `01_Flange_Disc` 体),
+所以 `run.json` 里如实记了 `01 = done` —— 在 NX 里点 **Run Next Step / Run All Automatic**
+会从 02 开始,不会重复建一个圆柱。注意 live/batch 自动执行**不按 gate 停**(见第 18 节),
+要继续执行剩下的步骤,建议用 NX 菜单里的 Review Plan 对话框。
 
 ---
 

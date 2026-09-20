@@ -3,6 +3,8 @@ config.json
 *.key
 .env
 .env.*
+# 由 dc\autostart-on.cmd 生成,内容是本机 node 路径(每台机器不同)
+plchat-local/dc/host_watchdog.conf
 
 # ── 从本机 NX 安装或西门子 CDN 取得的文件(版权归 Siemens,勿再分发) ──
 # 用 plchat-local/fetch-frontend.sh 与 fetch-assets.sh 在本机重新生成

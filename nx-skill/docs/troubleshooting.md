@@ -124,6 +124,22 @@ to see it, that was a live task.
   `nx_live_run_python_inline` if you genuinely intend to run code, and say so.
 - **Server exits immediately**: it reads stdin until EOF. If there is no client
   holding the pipe open, use `nx-skill <command>` instead.
+- **"无法执行 python 脚本。有关更多详细信息，请参见系统日志。"** (or any generic,
+  localised NX message that hides a Python failure): NX replaces the script's own
+  exception with its own text, so this message alone tells you nothing. Read the
+  traceback the payload leaves next to the generated script —
+  `<workspace>/generated/<script>.error.txt` — or the Listing Window in NX: both get the
+  full traceback before the exception is re-raised, so the step still reports `failed`
+  and nothing is swallowed.
+
+  The most common cause is a **missing submodule import**. `import NXOpen` does *not*
+  make `NXOpen.Features` / `NXOpen.GeometricUtilities` available, because the live bridge
+  runs the script through `runpy` in a bare interpreter. Measured on 2606, only
+  `Session`, `BaseSession` and `UI` are already present; every other submodule must be
+  imported explicitly. The journal (batch) path preloads them, which is exactly why a
+  script can pass headless and still fail live. Note also that once any script in the same
+  NX session has imported a submodule it stays in `sys.modules`, so a later script
+  "works" — this failure therefore only reproduces in a fresh session.
 
 ## Environment reference
 

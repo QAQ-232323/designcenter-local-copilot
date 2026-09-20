@@ -44,6 +44,12 @@ to_posix() {
 is_install() {
   [ -n "$1" ] && [ -d "$1/UGII/copilot/plchat" ]
 }
+# 从目录名里取 4 位版本号("DC 2606" -> 2606),取不到给 0
+release_of() {
+  local tok
+  tok="$(basename "$1" | grep -oE '(^|[^0-9])[0-9]{4}([^0-9]|$)' | head -1 | grep -oE '[0-9]{4}')"
+  printf '%s' "${tok:-0}"
+}
 find_install() {
   local u
   # 1) 显式指定优先
@@ -58,12 +64,17 @@ find_install() {
     if is_install "$u"; then printf '%s\n' "$u"; return; fi
     if is_install "$(dirname "$u")"; then printf '%s\n' "$(dirname "$u")"; return; fi
   fi
-  # 3) 常见安装位置
-  local c
+  # 3) 常见安装位置: 全部收集后取**版本号最高**的那个(2606 > 2506 > 2406 > 2306 ...)
+  #    同一台机器可能同时装着几个版本,挑最新的是最合理的默认值。
+  local c cands=""
   for c in "/d/Program Files/Siemens"/* "/c/Program Files/Siemens"/* \
-           "/d/Program Files/Siemens"/NX* "/c/Program Files/Siemens"/NX*; do
-    is_install "$c" && { printf '%s\n' "$c"; return; }
+           "/e/Program Files/Siemens"/*; do
+    is_install "$c" && cands="$cands$c"$'\n'
   done
+  [ -z "$cands" ] && return
+  printf '%s' "$cands" | while IFS= read -r line; do
+    [ -n "$line" ] && printf '%s\t%s\n' "$(release_of "$line")" "$line"
+  done | sort -t$'\t' -k1,1 -rn | head -1 | cut -f2-
 }
 INSTALL="$(find_install)"
 if [ -z "$INSTALL" ]; then
@@ -76,25 +87,21 @@ echo "页面脚本 : $SRC"
 echo
 
 # ---------- 2. 复制页面脚本 ------------------------------------------------
-PAGE_FILES=(
-  AppService.js
-  HostInteropService.js
-  NXService.js
-  PLChatAgentEventHandler.js
-  PLChatEventHandler.js
-  PLChatFeedbackEventUtils.js
-  hostInterop_async.js
-  plchat.js
-)
-for f in "${PAGE_FILES[@]}"; do
-  if [ -f "$SRC/$f" ]; then
-    cp -f "$SRC/$f" "$HERE/$f"
-    # 安装目录里的文件是只读的, cp 会把只读属性带过来, 后面打补丁就写不进去
-    chmod u+w "$HERE/$f" 2>/dev/null || true
-    echo "COPY  $f  ($(wc -c < "$HERE/$f") bytes)"
-  else
-    echo "MISS  $f  <- 你的安装里没有这个文件, 页面可能跑不起来" >&2
-  fi
+# 版本之间文件名会有出入(2306/2406 的页面脚本未必和 2606 同名),所以规则是
+# "安装里有哪些 .js 就拷哪些";下面这份已知清单只用来提示缺件,不再是唯一来源。
+PAGE_KNOWN="AppService.js HostInteropService.js NXService.js PLChatAgentEventHandler.js PLChatEventHandler.js PLChatFeedbackEventUtils.js hostInterop_async.js plchat.js"
+PAGE_ACTUAL="$(cd "$SRC" 2>/dev/null && ls *.js 2>/dev/null | tr '\n' ' ')"
+for f in $PAGE_ACTUAL; do
+  cp -f "$SRC/$f" "$HERE/$f"
+  # 安装目录里的文件是只读的, cp 会把只读属性带过来, 后面打补丁就写不进去
+  chmod u+w "$HERE/$f" 2>/dev/null || true
+  echo "COPY  $f  ($(wc -c < "$HERE/$f") bytes)"
+done
+for f in $PAGE_KNOWN; do
+  case " $PAGE_ACTUAL " in
+    *" $f "*) ;;
+    *) echo "MISS  $f  <- 这个安装里没有该文件(不同版本文件名可能不一样, 以实际拷到的为准)" >&2 ;;
+  esac
 done
 # 参考用: 原始入口页(我们不用它, 用自己的 index.html)
 [ -f "$SRC/PLChat.html" ] && cp -f "$SRC/PLChat.html" "$HERE/PLChat.original.html"
