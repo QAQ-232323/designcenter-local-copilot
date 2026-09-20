@@ -4,8 +4,8 @@
   "description": "Release-agnostic Siemens NX modelling skill: discovers any local NX installation, answers NXOpen API questions from the documentation shipped inside the install, and drives NX through batch journals or a live in-session bridge.",
   "author": { "name": "nx-skill contributors" },
   "license": "MIT",
-  "homepage": "https://github.com/kamao6757-crypto/nx-skill",
-  "repository": "https://github.com/kamao6757-crypto/nx-skill",
+  "homepage": "https://github.com/kamao6757-crypto/designcenter-local-copilot/tree/main/nx-skill",
+  "repository": "https://github.com/kamao6757-crypto/designcenter-local-copilot",
   "keywords": [
     "siemens-nx", "nxopen", "cad", "automation", "modeling", "simulation",
     "cae", "image-modeling", "three-view", "orthographic",

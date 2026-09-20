@@ -35,7 +35,7 @@ dev = ["pytest>=7", "pytest-cov"]
 nx-skill = "nx_skill.cli:main"
 
 [project.urls]
-Documentation = "https://github.com/kamao6757-crypto/nx-skill#readme"
+Documentation = "https://github.com/kamao6757-crypto/designcenter-local-copilot/tree/main/nx-skill#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nx_skill"]

@@ -23,4 +23,4 @@ for (const [label, f] of Object.entries(files)) {
   }
   if (!any) console.log("    !! 一个特征串都没找到, 可能没打补丁");
 }
-console.log(missing ? "\n有 " + missing + " 个文件不存在, 先编译桥: 见 integrations/nx-skill/README.md" : "\n检查完毕");
+console.log(missing ? "\n有 " + missing + " 个文件不存在, 先编译桥(powershell -File nx-skill/scripts/build_dotnet_bridge.ps1)" : "\n检查完毕");

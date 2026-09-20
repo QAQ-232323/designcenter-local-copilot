@@ -212,7 +212,9 @@ bash fetch-frontend.sh --skip-cdn # 只从本机安装取页面脚本, 完全不
 
 `LICENSE`(MIT)**只覆盖本仓库的自研代码** —— 即 `server.js`、`settings.js`、`host-stub.js`、
 `des-plchat-acc-local.js`、`index.html`、`fetch-frontend.sh`、`dc/*.cmd`、`tools/*`、
-`integrations/` 下我们改的部分,以及全部文档。
+以及全部文档。
+
+`nx-skill/` 是独立的 MIT 项目,授权见 `nx-skill/LICENSE`,不适用本仓库的 MIT。
 
 ### 同样不入库的
 

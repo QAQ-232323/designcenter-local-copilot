@@ -35,7 +35,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `check-bridge.js` | 检查 .NET 实时桥的两个产物是不是"已钉死 127.0.0.1"的版本(见 `integrations/nx-skill/`) |
+| `check-bridge.js` | 检查 .NET 实时桥的两个产物是不是"已钉死 127.0.0.1"的版本(背景见 `nx-skill/docs/troubleshooting.md` 的 live bridge 小节) |
 | `build-nxopen-index.py` | 从本机 NX 安装的 `NXOpen.xml` 抽全部 API 名 → `../cache/nxopen-names.txt`。静态门禁靠它判断"你写的这个 API 名到底存不存在" |
 
 ## 会话工具(与 NX 无关,是研究阶段用的)

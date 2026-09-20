@@ -73,9 +73,14 @@ There are **no runtime dependencies** — standard library only, so the package
 imports on a bare machine and inside NX's embedded interpreter, where pip is
 unavailable.
 
+This package lives in the `nx-skill/` subdirectory of
+[`designcenter-local-copilot`](https://github.com/kamao6757-crypto/designcenter-local-copilot),
+where it is the modelling half of a larger integration. It has no dependency on
+its parent and works standalone — copy the directory anywhere.
+
 ```bash
-git clone https://github.com/kamao6757-crypto/nx-skill
-cd nx-skill
+git clone --depth 1 https://github.com/kamao6757-crypto/designcenter-local-copilot
+cd designcenter-local-copilot/nx-skill
 pip install -e .
 nx-skill doctor
 ```
