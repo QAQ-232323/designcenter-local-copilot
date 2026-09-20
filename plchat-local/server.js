@@ -58,6 +58,7 @@ function loadConfig() {
     python: raw.python || "python",
     toolTimeoutMs: raw.toolTimeoutMs || 60000,
     maxToolRounds: raw.maxToolRounds || 8,
+    cleanupOnNxExit: ["all", "scratch", "smart", "off"].includes(raw.cleanupOnNxExit) ? raw.cleanupOnNxExit : "all",
     colorTheme: raw.colorTheme || "light",
     locale: raw.locale || "en_US",
     version: raw.version || "2606.1700"
@@ -77,7 +78,8 @@ function loadConfig() {
 }
 
 function saveConfig(cfg) {
-  fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2));
+  // 保留 loadConfig 未映射的配置项,例如退出 NX 时的清理策略。
+  fs.writeFileSync(CFG_PATH, JSON.stringify(Object.assign({}, loadRaw(), cfg), null, 2));
 }
 
 /** 取当前生效的供应商参数 */
@@ -305,7 +307,8 @@ function queueLooksFinished(cfg) {
   const logPath = path.join(path.dirname(planPath), "run.json");
   let log = null; try { log = JSON.parse(fs.readFileSync(logPath, "utf8")); } catch (e) { }
   const done = {};
-  ((log && log.records) || []).forEach(r => { done[r.id] = r.status; });
+  const records = log && (Array.isArray(log.steps) ? log.steps : log.records);
+  (Array.isArray(records) ? records : []).forEach(r => { done[r.id] = r.status; });
   const pending = ids.filter(id => !done[id] || done[id] === "pending" || done[id] === "running");
   return pending.length === 0;
 }
@@ -1291,7 +1294,8 @@ const server = http.createServer(async (req, res) => {
     const plan = dir ? readJson(path.join(dir, "plan.json")) : null;
     const log = dir ? readJson(path.join(dir, "run.json")) : null;
     const byId = {};
-    ((log && log.records) || []).forEach(r => { byId[r.id] = r; });
+    const records = log && (Array.isArray(log.steps) ? log.steps : log.records);
+    (Array.isArray(records) ? records : []).forEach(r => { byId[r.id] = r; });
     const steps = ((plan && plan.steps) || []).map(s => {
       const r = byId[s.id] || {};
       return { id: s.id, name: s.name, operation: s.operation, gate: s.gate, note: s.note || "",
@@ -1357,6 +1361,7 @@ const server = http.createServer(async (req, res) => {
           console.log("[author] " + (out.ok ? "成功 第" + out.attempt + "次 计划 " + out.planId : "失败: " + out.error) + " | " + (Date.now() - t0) + "ms");
           return Object.assign({ ms: Date.now() - t0 }, out);
         } catch (e) {
+          progressEnd("failed");
           return { ok: false, error: String(e.message || e), ms: Date.now() - t0 };
         }
       };
@@ -1393,7 +1398,7 @@ const server = http.createServer(async (req, res) => {
           const out = live ? await runPlanLive(cfg) : await runPlanBatch(cfg);
           console.log("[run] " + (out.ok ? "成功 零件 " + out.part : "失败: " + out.error) + " | " + (Date.now() - t0) + "ms");
           return Object.assign({ ms: Date.now() - t0 }, out);
-        } catch (e) { return { ok: false, error: String(e.message || e), ms: Date.now() - t0 }; }
+        } catch (e) { progressEnd("failed"); return { ok: false, error: String(e.message || e), ms: Date.now() - t0 }; }
       };
       if (b.wait === true) { sendJson(res, await run()); return; }
       const id = "run" + (++JOB_SEQ);

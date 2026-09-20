@@ -1,4 +1,8 @@
-# Designcenter 2606 内置 AI(Copilot)页面 — 本地调出方案
+# Designcenter 2606 本地 Copilot 工作台与原版页面
+
+> **本地工作台（新首页）**：启动 `plchat-local/start.cmd` 或在该目录运行 `node server.js 8765`，打开 `http://127.0.0.1:8765/`。新页面把模型配置、聊天、建模计划、复核状态和执行日志放在同一页，使用现有本地 API，不依赖重建官方前端。原版页面保留在 `/legacy.html`，需要先运行 `fetch-frontend.sh` 重建本机已授权的前端资源才能使用。
+
+本地工作台的“生成计划”会提交复核队列；在 NX 中打开 **NX Skill → Review Plan** 可逐步检查和执行。工作台另提供 Live 与 Batch 自动执行，两者会执行 journal 步骤，**不会按计划中的 `gate=manual` 逐步暂停**；点击前会显示执行目标和确认提示。是否真正建模成功须以 NX 的执行结果为准。
 
 把 Siemens Designcenter / NX **内置的 Copilot 页面**在本地宿主里跑起来,后端换成你自己的模型,
 再通过 [nx-skill](nx-skill/)(本仓库子项目)让它**真的能建模** —— 出计划、过门禁、在 NX 里执行。
@@ -18,7 +22,7 @@
 `NXService.js` 等 8 个,以及 webpack 应用 `plchat_v2` —— 都由 `plchat-local/fetch-frontend.sh`
 从**你自己已授权的 Designcenter/NX 安装目录**里重建。详见第 10 节。
 
-### 三步跑起来
+### 原版页面：三步跑起来
 
 ```bash
 cd plchat-local

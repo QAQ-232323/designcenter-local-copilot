@@ -32,6 +32,8 @@ graphflow-out/
 _dcmcp-analysis/
 *.tmp
 *.bak
+output/
+.playwright-cli/
 
 # ── 编辑器 / 系统 ───────────────────────────────────
 .vscode/
